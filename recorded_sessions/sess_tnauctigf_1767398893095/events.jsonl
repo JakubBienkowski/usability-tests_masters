@@ -1,0 +1,13 @@
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:20.267Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button#btn-red", "duration_ms": 904}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:21.297Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button#btn-red", "duration_ms": 860}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:21.896Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "form#feedback-form", "duration_ms": 598}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:28.088Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button#btn-blue", "duration_ms": 6191}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:29.670Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "input#input-email", "duration_ms": 1178}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:31.410Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button#btn-blue", "duration_ms": 1739}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:32.393Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "input#input-email", "duration_ms": 664}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:36.314Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "form#feedback-form", "duration_ms": 3106}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:38.496Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "p", "duration_ms": 2181}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:39.115Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button", "duration_ms": 618}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:50.957Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "p", "duration_ms": 11841}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:51.994Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "button#btn-red", "duration_ms": 505}}
+{"session_id": "sess_tnauctigf_1767398893095", "timestamp": "2026-01-03T00:09:52.971Z", "type": "gaze_fixation", "url": "http://localhost:5173/", "details": {"element": "p", "duration_ms": 977}}
