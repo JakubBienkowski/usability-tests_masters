@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: ux_tracker_queue
+    ports:
+      - "5672:5672"   
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: ux_tracker_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./recorded_sessions:/app/recorded_sessions
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build: .
+    container_name: ux_tracker_worker
+    command: python worker.py
+    volumes:
+      - ./recorded_sessions:/app/recorded_sessions
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  recorded_sessions:
