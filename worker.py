@@ -1,41 +1,58 @@
 import asyncio
-import aio_pika
 import json
 import os
+from pathlib import Path
 
-# Konfiguracja ścieżek
-BASE_DIR = "recorded_sessions"
+import aio_pika
 
-async def on_message(message: aio_pika.IncomingMessage):
+
+BASE_DIR = Path(os.getenv("RECORDED_SESSIONS_DIR", "recorded_sessions"))
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/")
+EVENTS_FILE = "events.jsonl"
+RRWEB_FILE = "dom_recording.jsonl"
+
+
+def ensure_session_dir(session_id: str) -> Path:
+    path = BASE_DIR / session_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def on_message(message: aio_pika.IncomingMessage) -> None:
     async with message.process():
         data = json.loads(message.body)
-        session_id = data.get("session_id", "unknown")
-        
-        # Tworzymy strukturę plików dla każdej sesji
-        session_path = os.path.join(BASE_DIR, session_id)
-        os.makedirs(session_path, exist_ok=True)
-        
-        # Dzielimy logikę zapisu wg typu zdarzenia
-        msg_type = data.get("type")
-        
-        if msg_type == "rrweb_chunk":
-            # Zapisujemy nagranie DOM (rrweb)
-            with open(f"{session_path}/dom_recording.jsonl", "a") as f:
-                f.write(json.dumps(data.get("events")) + "\n")
-        else:
-            # Zapisujemy zdarzenia użytkownika (kliknięcia, nawigacja)
-            with open(f"{session_path}/events.jsonl", "a") as f:
-                f.write(json.dumps(data) + "\n")
-                
-        print(f" [x] Przetworzono event typu: {msg_type} dla sesji: {session_id}")
+        session_id = data.get("session_id") or data.get("event", {}).get("session_id") or "unknown"
+        session_path = ensure_session_dir(session_id)
+        kind = data.get("kind", "event")
 
-async def main():
-    connection = await aio_pika.connect_robust("amqp://guest:guest@rabbitmq/")
+        if kind == "rrweb":
+            row = {
+                "timestamp": data.get("timestamp"),
+                "received_at": data.get("received_at"),
+                "source": data.get("source"),
+                "context": data.get("context", {}),
+                "events": data.get("events", []),
+            }
+            with (session_path / RRWEB_FILE).open("a") as handle:
+                handle.write(json.dumps(row) + "\n")
+            print(f"[x] Stored rrweb chunk for session={session_id} size={len(row['events'])}")
+            return
+
+        event = data.get("event", data)
+        with (session_path / EVENTS_FILE).open("a") as handle:
+            handle.write(json.dumps(event) + "\n")
+        print(
+            f"[x] Stored event type={event.get('event_type', 'unknown')} session={session_id}"
+        )
+
+
+async def main() -> None:
+    connection = await aio_pika.connect_robust(RABBITMQ_URL)
     channel = await connection.channel()
     queue = await channel.declare_queue("ux_events", durable=True)
-    
     await queue.consume(on_message)
-    await asyncio.Future()  # Trzymaj proces uruchomiony
+    await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
