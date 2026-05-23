@@ -1,6 +1,7 @@
 import { record } from 'rrweb';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
 import webgazer from 'webgazer';
+import { evaluateCompletionRule } from '../shared/taskRules.js';
 
 if (window.__uxTestPlatformContentLoaded) {
   console.warn('[ux-test-platform] duplicate_content_script_skipped');
@@ -10,6 +11,8 @@ if (window.__uxTestPlatformContentLoaded) {
 const SOURCE = 'browser_extension_content';
 const TRACKER_NAME = 'ExtensionTfjsFaceMesh';
 const GAZE_EVENT_INTERVAL_MS = 50;
+const LOCAL_GAZE_BRIDGE_HTTP = 'http://127.0.0.1:8790';
+const LOCAL_GAZE_BRIDGE_WS = 'ws://127.0.0.1:8790/ws/gaze';
 const EYE_INDICES = {
   leftEyeUpper0: [466, 388, 387, 386, 385, 384, 398],
   leftEyeLower0: [263, 249, 390, 373, 374, 380, 381, 382, 362],
@@ -21,6 +24,7 @@ let trackerState = {
   trackingEnabled: false,
   captureGaze: true,
   sessionId: null,
+  activeTask: null,
 };
 
 let rrwebStop = null;
@@ -60,16 +64,35 @@ let calibrationTargetClicks = 0;
 const CALIBRATION_CLICKS_PER_TARGET = 2;
 const CALIBRATION_MIN_EXISTING_SAMPLES = 18;
 const CALIBRATION_TARGETS = [
-  { x: 0.16, y: 0.2 },
-  { x: 0.5, y: 0.2 },
-  { x: 0.84, y: 0.2 },
+  { x: 0.12, y: 0.08 },
+  { x: 0.5, y: 0.08 },
+  { x: 0.88, y: 0.08 },
   { x: 0.16, y: 0.5 },
   { x: 0.5, y: 0.5 },
   { x: 0.84, y: 0.5 },
-  { x: 0.16, y: 0.8 },
-  { x: 0.5, y: 0.8 },
-  { x: 0.84, y: 0.8 },
+  { x: 0.12, y: 0.92 },
+  { x: 0.5, y: 0.92 },
+  { x: 0.88, y: 0.92 },
 ];
+let localBridgeSocket = null;
+let localBridgeMode = false;
+let localCalibrationTargets = [];
+let localCalibrationRequired = false;
+let localBridgeConnected = false;
+let localCalibrationClicksPerTarget = CALIBRATION_CLICKS_PER_TARGET;
+let lastSmoothedLocalPoint = null;
+let lastSmoothedWebPoint = null;
+let taskCheckTimer = null;
+
+const smoothPoint = (nextPoint, previousPoint, alpha = 0.35) => {
+  if (!previousPoint) return nextPoint;
+  const distance = Math.hypot(nextPoint.x - previousPoint.x, nextPoint.y - previousPoint.y);
+  if (distance > 220) return nextPoint;
+  return boundToViewport(
+    previousPoint.x + (nextPoint.x - previousPoint.x) * alpha,
+    previousPoint.y + (nextPoint.y - previousPoint.y) * alpha
+  );
+};
 
 const ensureExtensionGazeDot = () => {
   if (extensionGazeDot?.isConnected) return extensionGazeDot;
@@ -116,6 +139,15 @@ const boundToViewport = (x, y) => ({
 const calibrationTargetPoint = (target) =>
   boundToViewport(window.innerWidth * target.x, window.innerHeight * target.y);
 
+const screenPointToViewport = (screenX, screenY) => {
+  const sideChrome = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const topChrome = Math.max(0, window.outerHeight - window.innerHeight - sideChrome);
+  return boundToViewport(
+    screenX - window.screenX - sideChrome,
+    screenY - window.screenY - topChrome
+  );
+};
+
 const getRegressionDataSize = () => {
   try {
     const regressions = webgazer.getRegression?.();
@@ -127,7 +159,9 @@ const getRegressionDataSize = () => {
         return count;
       }, 0);
     }
-  } catch {}
+  } catch {
+    return null;
+  }
   return null;
 };
 
@@ -149,8 +183,31 @@ const removeCalibrationOverlay = () => {
   calibrationOverlay = null;
 };
 
-const emitCalibrationPoint = (x, y) => {
+const currentCalibrationTargets = () =>
+  localBridgeMode && localCalibrationTargets.length ? localCalibrationTargets : CALIBRATION_TARGETS;
+
+const emitCalibrationPoint = async (x, y, target) => {
   trainingSampleCount += 1;
+  if (localBridgeMode) {
+    await fetchLocalBridgeJson('/calibration/sample', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_x: target.x,
+        target_y: target.y,
+        screen_x: x,
+        screen_y: y,
+      }),
+    });
+    reportDiagnostic('local_calibration_sample_recorded', {
+      x,
+      y,
+      targetX: target.x,
+      targetY: target.y,
+    });
+    return;
+  }
+
   try {
     if (trackerState.trackingEnabled && trackerState.captureGaze && webgazer) {
       webgazer.recordScreenPosition(x, y, 'click');
@@ -176,9 +233,17 @@ const emitCalibrationPoint = (x, y) => {
 };
 
 const finishCalibrationOverlay = () => {
+  sendEvent('calibration_completed', {
+    target_count: currentCalibrationTargets().length,
+    clicks_per_target: localCalibrationClicksPerTarget,
+    regressionDataSize: getRegressionDataSize(),
+    source_mode: localBridgeMode ? 'local_bridge' : 'webgazer',
+  });
   reportDiagnostic('calibration_overlay_completed', {
     regressionDataSize: getRegressionDataSize(),
+    source_mode: localBridgeMode ? 'local_bridge' : 'webgazer',
   });
+  localCalibrationRequired = false;
   removeCalibrationOverlay();
 };
 
@@ -187,13 +252,13 @@ const renderCalibrationOverlay = () => {
 
   const progress = calibrationOverlay.querySelector('[data-role="progress"]');
   if (progress) {
-    progress.textContent = `Target ${calibrationTargetIndex + 1}/${CALIBRATION_TARGETS.length} • Click ${calibrationTargetClicks + 1}/${CALIBRATION_CLICKS_PER_TARGET}`;
+    progress.textContent = `Target ${calibrationTargetIndex + 1}/${currentCalibrationTargets().length} • Click ${calibrationTargetClicks + 1}/${localCalibrationClicksPerTarget}`;
   }
 
   const buttons = calibrationOverlay.querySelectorAll('[data-calibration-index]');
   buttons.forEach((button) => {
     const index = Number(button.getAttribute('data-calibration-index'));
-    const point = calibrationTargetPoint(CALIBRATION_TARGETS[index]);
+    const point = calibrationTargetPoint(currentCalibrationTargets()[index]);
     button.style.left = `${point.x}px`;
     button.style.top = `${point.y}px`;
     button.style.opacity = index === calibrationTargetIndex ? '1' : '0.28';
@@ -215,6 +280,12 @@ const startCalibrationOverlay = () => {
   calibrationActive = true;
   calibrationTargetIndex = 0;
   calibrationTargetClicks = 0;
+  sendEvent('calibration_started', {
+    target_count: currentCalibrationTargets().length,
+    clicks_per_target: localCalibrationClicksPerTarget,
+    regressionDataSize: getRegressionDataSize(),
+    source_mode: localBridgeMode ? 'local_bridge' : 'webgazer',
+  });
 
   const overlay = document.createElement('div');
   overlay.id = 'ux-test-platform-calibration-overlay';
@@ -238,7 +309,7 @@ const startCalibrationOverlay = () => {
   panel.style.pointerEvents = 'none';
 
   const title = document.createElement('div');
-  title.textContent = 'Calibration';
+  title.textContent = localBridgeMode ? 'Desktop Calibration' : 'Calibration';
   title.style.fontWeight = '700';
   title.style.marginBottom = '4px';
   panel.appendChild(title);
@@ -248,7 +319,7 @@ const startCalibrationOverlay = () => {
   panel.appendChild(progress);
   overlay.appendChild(panel);
 
-  CALIBRATION_TARGETS.forEach((target, index) => {
+  currentCalibrationTargets().forEach((target, index) => {
     const button = document.createElement('button');
     button.type = 'button';
     button.setAttribute('data-calibration-index', String(index));
@@ -270,20 +341,28 @@ const startCalibrationOverlay = () => {
       if (index !== calibrationTargetIndex) return;
 
       const point = calibrationTargetPoint(target);
-      emitCalibrationPoint(point.x, point.y);
-      calibrationTargetClicks += 1;
+      Promise.resolve(emitCalibrationPoint(point.x, point.y, target))
+        .then(() => {
+          calibrationTargetClicks += 1;
 
-      if (calibrationTargetClicks >= CALIBRATION_CLICKS_PER_TARGET) {
-        calibrationTargetClicks = 0;
-        calibrationTargetIndex += 1;
-      }
+          if (calibrationTargetClicks >= localCalibrationClicksPerTarget) {
+            calibrationTargetClicks = 0;
+            calibrationTargetIndex += 1;
+          }
 
-      if (calibrationTargetIndex >= CALIBRATION_TARGETS.length) {
-        finishCalibrationOverlay();
-        return;
-      }
+          if (calibrationTargetIndex >= currentCalibrationTargets().length) {
+            finishCalibrationOverlay();
+            return;
+          }
 
-      renderCalibrationOverlay();
+          renderCalibrationOverlay();
+        })
+        .catch((error) => {
+          reportDiagnostic('calibration_click_failed', {
+            message: error?.message || String(error),
+            source_mode: localBridgeMode ? 'local_bridge' : 'webgazer',
+          });
+        });
     });
     overlay.appendChild(button);
   });
@@ -482,6 +561,14 @@ class ExtensionTfjsFaceMesh {
 const postMessage = (payload) =>
   chrome.runtime.sendMessage(payload).catch(() => {});
 
+const fetchLocalBridgeJson = async (path, options = {}) => {
+  const response = await fetch(`${LOCAL_GAZE_BRIDGE_HTTP}${path}`, options);
+  if (!response.ok) {
+    throw new Error(`Local bridge request failed: ${response.status}`);
+  }
+  return response.json();
+};
+
 const reportDiagnostic = (message, details = {}) => {
   console.log('[ux-test-platform]', message, details);
   postMessage({
@@ -545,6 +632,58 @@ const sendEvent = (eventType, payload = {}) => {
   });
 };
 
+const checkActiveTaskCompletion = (reason = 'state_check') => {
+  const activeTask = trackerState.activeTask;
+  if (!trackerState.trackingEnabled || !activeTask?.id) return;
+
+  const result = evaluateCompletionRule(activeTask.completionRule || activeTask.completion_rule, {
+    url: window.location.href,
+    text: document.body?.innerText || '',
+    querySelector: (selector) => document.querySelector(selector),
+  });
+  if (result.error) {
+    reportDiagnostic('task_rule_invalid_selector', {
+      taskId: activeTask.id,
+      selector: result.rule.value,
+      message: result.error?.message || String(result.error),
+    });
+    trackerState = {
+      ...trackerState,
+      activeTask: {
+        ...activeTask,
+        completionRule: { type: 'manual', value: '' },
+      },
+    };
+    return;
+  }
+
+  if (!result.matched) return;
+
+  trackerState = {
+    ...trackerState,
+    activeTask: null,
+  };
+  postMessage({
+    type: 'TASK_AUTO_COMPLETED',
+    taskId: activeTask.id,
+    label: activeTask.label,
+    matchedRule: result.rule.type,
+    matchedValue: result.rule.value,
+    reason,
+    context: baseContext(),
+  });
+};
+
+const scheduleTaskCheck = (reason) => {
+  if (taskCheckTimer) {
+    window.clearTimeout(taskCheckTimer);
+  }
+  taskCheckTimer = window.setTimeout(() => {
+    taskCheckTimer = null;
+    checkActiveTaskCompletion(reason);
+  }, 300);
+};
+
 const flushRrweb = () => {
   if (!trackerState.trackingEnabled || !rrwebBuffer.length) return;
   const chunk = [...rrwebBuffer];
@@ -594,6 +733,189 @@ const stopRrweb = () => {
   rrwebStop = null;
 };
 
+const syncLocalCalibrationStatus = async () => {
+  const status = await fetchLocalBridgeJson('/calibration/status');
+  localCalibrationRequired = Boolean(status.required || status.active);
+  localCalibrationTargets = Array.isArray(status.targets) && status.targets.length
+    ? status.targets
+    : CALIBRATION_TARGETS;
+  localCalibrationClicksPerTarget = Number(status.samples_per_target || CALIBRATION_CLICKS_PER_TARGET);
+  return status;
+};
+
+const startLocalCalibration = async () => {
+  const status = await fetchLocalBridgeJson('/calibration/start', {
+    method: 'POST',
+  });
+  localCalibrationRequired = Boolean(status.required || status.active);
+  localCalibrationTargets = Array.isArray(status.targets) && status.targets.length
+    ? status.targets
+    : CALIBRATION_TARGETS;
+  localCalibrationClicksPerTarget = Number(status.samples_per_target || CALIBRATION_CLICKS_PER_TARGET);
+  startCalibrationOverlay();
+  return status;
+};
+
+const handleLocalBridgePoint = (payload) => {
+  const normalizedX = typeof payload?.normalized_x === 'number'
+    ? payload.normalized_x
+    : typeof payload?.projected_normalized_x === 'number'
+      ? payload.projected_normalized_x
+      : null;
+  const normalizedY = typeof payload?.normalized_y === 'number'
+    ? payload.normalized_y
+    : typeof payload?.projected_normalized_y === 'number'
+      ? payload.projected_normalized_y
+      : null;
+
+  const mappedPoint =
+    normalizedX !== null && normalizedY !== null
+      ? screenPointToViewport(
+          normalizedX * (payload?.viewport?.width || window.screen.width),
+          normalizedY * (payload?.viewport?.height || window.screen.height)
+        )
+      : screenPointToViewport(payload?.screen_x ?? 0, payload?.screen_y ?? 0);
+  const boundedPoint = smoothPoint(mappedPoint, lastSmoothedLocalPoint, 0.42);
+  lastSmoothedLocalPoint = boundedPoint;
+
+  lastGazeData = boundedPoint;
+  lastGazeDataAt = Date.now();
+  showExtensionGazeDot(boundedPoint.x, boundedPoint.y);
+
+  const now = Date.now();
+  const pointedElement = document.elementFromPoint(boundedPoint.x, boundedPoint.y);
+  const meaningfulElement = pointedElement?.closest(
+    'button, input, a, h1, h2, h3, p, img, form, textarea, label'
+  );
+
+  if (now - lastGazeSentAt >= GAZE_EVENT_INTERVAL_MS) {
+    lastGazeSentAt = now;
+    gazePointEventCount += 1;
+    sendEvent('gaze_point', {
+      ...payload,
+      provider: 'desktop_agent_bridge',
+      provider_type: 'local_bridge',
+      bridge_mode: 'local_agent',
+      screen_x: boundedPoint.x,
+      screen_y: boundedPoint.y,
+      normalized_x: Number((boundedPoint.x / Math.max(window.innerWidth, 1)).toFixed(6)),
+      normalized_y: Number((boundedPoint.y / Math.max(window.innerHeight, 1)).toFixed(6)),
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      },
+    });
+  }
+
+  if (!meaningfulElement) return;
+
+  if (meaningfulElement !== lastLookedElement) {
+    const duration = now - fixationStartedAt;
+    if (lastLookedElement && duration > 400) {
+      sendEvent('gaze_fixation', {
+        ...getElementPayload(lastLookedElement),
+        duration_ms: duration,
+        provider: 'desktop_agent_bridge',
+        provider_type: 'local_bridge',
+        bridge_mode: 'local_agent',
+      });
+    }
+    lastLookedElement = meaningfulElement;
+    fixationStartedAt = now;
+  }
+};
+
+const connectLocalBridge = async () => {
+  await fetchLocalBridgeJson('/health');
+  await syncLocalCalibrationStatus();
+
+  await new Promise((resolve, reject) => {
+    const socket = new WebSocket(LOCAL_GAZE_BRIDGE_WS);
+    localBridgeSocket = socket;
+
+    const cleanup = () => {
+      socket.removeEventListener('open', onOpen);
+      socket.removeEventListener('error', onError);
+    };
+
+    const onOpen = () => {
+      cleanup();
+      localBridgeConnected = true;
+      localBridgeMode = true;
+      reportDiagnostic('local_bridge_connected', {
+        bridge: LOCAL_GAZE_BRIDGE_WS,
+      });
+      sendEvent('gaze_provider_status', {
+        status: 'connected',
+        provider: 'desktop_agent_bridge',
+        provider_type: 'local_bridge',
+        bridge_mode: 'local_agent',
+      });
+      resolve();
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new Error('local_bridge_connection_failed'));
+    };
+
+    socket.addEventListener('open', onOpen);
+    socket.addEventListener('error', onError);
+    socket.addEventListener('message', (message) => {
+      const snapshot = JSON.parse(message.data);
+      const event = snapshot?.last_event;
+      if (!event) return;
+
+      if (event.event_type === 'gaze_provider_status') {
+        localCalibrationRequired = Boolean(event.payload?.calibration_required);
+        if (localCalibrationRequired && trackerState.trackingEnabled && trackerState.captureGaze) {
+          startCalibrationOverlay();
+        }
+        sendEvent('gaze_provider_status', {
+          ...event.payload,
+          provider: 'desktop_agent_bridge',
+          provider_type: 'local_bridge',
+          bridge_mode: 'local_agent',
+        });
+        return;
+      }
+
+      if (event.event_type === 'gaze_lost') {
+        sendEvent('gaze_lost', {
+          ...event.payload,
+          provider: 'desktop_agent_bridge',
+          provider_type: 'local_bridge',
+          bridge_mode: 'local_agent',
+        });
+        return;
+      }
+
+      if (event.event_type === 'gaze_point') {
+        handleLocalBridgePoint(event.payload || {});
+      }
+    });
+    socket.addEventListener('close', () => {
+      if (!localBridgeConnected) return;
+      localBridgeConnected = false;
+      localBridgeMode = false;
+      localCalibrationRequired = false;
+      hideExtensionGazeDot();
+      removeCalibrationOverlay();
+      reportDiagnostic('local_bridge_closed');
+    });
+  });
+};
+
+const stopLocalBridge = () => {
+  if (localBridgeSocket) {
+    localBridgeSocket.close();
+    localBridgeSocket = null;
+  }
+  localBridgeConnected = false;
+  localBridgeMode = false;
+  localCalibrationRequired = false;
+};
+
 const startGazeTracking = async () => {
   if (gazeInitialized || !trackerState.captureGaze) return;
   gazeInitialized = true;
@@ -603,6 +925,19 @@ const startGazeTracking = async () => {
   gazeNullCount = 0;
   trackerNullCount = 0;
   firstGazeSampleReported = false;
+
+  try {
+    await connectLocalBridge();
+    if (localCalibrationRequired) {
+      await startLocalCalibration();
+    }
+    return;
+  } catch (error) {
+    reportDiagnostic('local_bridge_unavailable', {
+      message: error?.message || String(error),
+    });
+    localBridgeMode = false;
+  }
 
   if (!trackerRegistered) {
     webgazer.addTrackerModule(TRACKER_NAME, ExtensionTfjsFaceMesh);
@@ -682,14 +1017,15 @@ const startGazeTracking = async () => {
           });
         }
 
-        const boundedPoint = boundToViewport(data.x, data.y);
+        const boundedPoint = smoothPoint(boundToViewport(data.x, data.y), lastSmoothedWebPoint, 0.5);
+        lastSmoothedWebPoint = boundedPoint;
         lastGazeData = boundedPoint;
         lastGazeDataAt = Date.now();
         showExtensionGazeDot(boundedPoint.x, boundedPoint.y);
 
         const now = Date.now();
-        const x = data.x;
-        const y = data.y;
+        const x = boundedPoint.x;
+        const y = boundedPoint.y;
         const pointedElement = document.elementFromPoint(x, y);
         const meaningfulElement = pointedElement?.closest(
           'button, input, a, h1, h2, h3, p, img, form, textarea, label'
@@ -747,6 +1083,21 @@ const startGazeTracking = async () => {
 };
 
 const updateGazeState = () => {
+  if (localBridgeMode) {
+    if (trackerState.trackingEnabled && trackerState.captureGaze) {
+      if (localCalibrationRequired && !calibrationActive) {
+        startCalibrationOverlay();
+      } else if (!localCalibrationRequired) {
+        removeCalibrationOverlay();
+      }
+    } else {
+      hideExtensionGazeDot();
+      removeCalibrationOverlay();
+      stopLocalBridge();
+    }
+    return;
+  }
+
   if (!webgazer) return;
 
   if (trackerState.trackingEnabled && trackerState.captureGaze) {
@@ -762,6 +1113,7 @@ const updateGazeState = () => {
     webgazer.showPredictionPoints(false);
     hideExtensionGazeDot();
     removeCalibrationOverlay();
+    stopLocalBridge();
   }
 };
 
@@ -782,6 +1134,7 @@ const handleClick = (event) => {
     button: event.button,
     ...getElementPayload(event.target),
   });
+  scheduleTaskCheck('click');
 };
 
 const handlePointerDown = (event) => {
@@ -799,6 +1152,7 @@ const handleScroll = () => {
     scroll_x: window.scrollX,
     scroll_y: window.scrollY,
   });
+  scheduleTaskCheck('scroll');
 };
 
 const handleResize = () => {
@@ -818,6 +1172,7 @@ const handleInput = (event) => {
     input_type: target?.type || null,
     value_length: typeof target?.value === 'string' ? target.value.length : null,
   });
+  scheduleTaskCheck('input');
 };
 
 const handleMouseMove = () => {
@@ -837,13 +1192,16 @@ const bindListeners = () => {
   window.addEventListener('pagehide', flushRrweb);
 
   routeObserver = new MutationObserver(() => {
-    if (window.location.href === currentUrl) return;
-    const previousUrl = currentUrl;
-    currentUrl = window.location.href;
-    sendEvent('route_changed', {
-      from: previousUrl,
-      to: currentUrl,
-    });
+    scheduleTaskCheck('dom_mutation');
+    if (window.location.href !== currentUrl) {
+      const previousUrl = currentUrl;
+      currentUrl = window.location.href;
+      sendEvent('route_changed', {
+        from: previousUrl,
+        to: currentUrl,
+      });
+      scheduleTaskCheck('route_changed');
+    }
   });
   routeObserver.observe(document, { subtree: true, childList: true });
 };
@@ -853,6 +1211,7 @@ const applyState = async (state) => {
     trackingEnabled: Boolean(state.trackingEnabled),
     captureGaze: state.captureGaze !== false,
     sessionId: state.sessionId || null,
+    activeTask: state.activeTask || null,
   };
 
   if (trackerState.trackingEnabled) {
@@ -868,6 +1227,7 @@ const applyState = async (state) => {
       height: window.innerHeight,
       source: SOURCE,
     });
+    scheduleTaskCheck('tracking_state');
   } else {
     reportDiagnostic('tracking_disabled', {
       url: window.location.href,

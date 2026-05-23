@@ -9,12 +9,45 @@ LOG_DIR="$ROOT_DIR/logs"
 EXT_DIR="$ROOT_DIR/ux-test-platform"
 EXT_DIST_DIR="$EXT_DIR/dist"
 DESKTOP_AGENT_PID_FILE="$RUN_DIR/desktop_agent.pid"
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+MODEL_DIR="$ROOT_DIR/models"
+FACE_LANDMARKER_MODEL_PATH="${UX_FACE_LANDMARKER_MODEL:-$MODEL_DIR/face_landmarker_v2.task}"
+FACE_LANDMARKER_MODEL_URL="${UX_FACE_LANDMARKER_MODEL_URL:-https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task}"
+ETH_XGAZE_MODEL_DIR="${UX_ETH_XGAZE_MODEL_DIR:-$MODEL_DIR/eth-xgaze}"
+ETH_XGAZE_MODEL_PATH="$ETH_XGAZE_MODEL_DIR/eth-xgaze_resnet18.pth"
+ETH_XGAZE_MODEL_URL="${UX_ETH_XGAZE_MODEL_URL:-https://github.com/hysts/pytorch_mpiigaze_demo/releases/download/v0.2.2/eth-xgaze_resnet18.pth}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_supported_python() {
+  local python_bin="$1"
+  local version
+  version="$("$python_bin" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  if [ "$version" != "3.12" ]; then
+    echo "Unsupported Python version from $python_bin: $version" >&2
+    echo "Desktop gaze tracking with MediaPipe currently requires Python 3.12 in this project." >&2
+    echo "Create the venv with Python 3.12 and rerun ./scripts/start_app.sh" >&2
+    exit 1
+  fi
+}
+
+require_supported_venv() {
+  if [ ! -x "$VENV_DIR/bin/python" ]; then
+    return
+  fi
+
+  local version
+  version="$("$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  if [ "$version" != "3.12" ]; then
+    echo "Existing virtualenv uses unsupported Python version: $version" >&2
+    echo "Remove $VENV_DIR and rerun ./scripts/start_app.sh with Python 3.12." >&2
     exit 1
   fi
 }
@@ -58,6 +91,36 @@ wait_for_backend() {
   exit 1
 }
 
+ensure_face_landmarker_model() {
+  if [ -f "$FACE_LANDMARKER_MODEL_PATH" ]; then
+    echo "Using face landmarker model: $FACE_LANDMARKER_MODEL_PATH"
+    return
+  fi
+
+  mkdir -p "$(dirname "$FACE_LANDMARKER_MODEL_PATH")"
+  echo "Downloading face landmarker model..."
+  if ! curl -fsSL "$FACE_LANDMARKER_MODEL_URL" -o "$FACE_LANDMARKER_MODEL_PATH"; then
+    echo "Failed to download face landmarker model from $FACE_LANDMARKER_MODEL_URL" >&2
+    exit 1
+  fi
+  echo "Stored face landmarker model at $FACE_LANDMARKER_MODEL_PATH"
+}
+
+ensure_eth_xgaze_model() {
+  if [ -f "$ETH_XGAZE_MODEL_PATH" ]; then
+    echo "Using ETH-XGaze checkpoint: $ETH_XGAZE_MODEL_PATH"
+    return
+  fi
+
+  mkdir -p "$ETH_XGAZE_MODEL_DIR"
+  echo "Downloading ETH-XGaze checkpoint..."
+  if ! curl -fsSL "$ETH_XGAZE_MODEL_URL" -o "$ETH_XGAZE_MODEL_PATH"; then
+    echo "Failed to download ETH-XGaze checkpoint from $ETH_XGAZE_MODEL_URL" >&2
+    exit 1
+  fi
+  echo "Stored ETH-XGaze checkpoint at $ETH_XGAZE_MODEL_PATH"
+}
+
 start_desktop_agent() {
   if [ -f "$DESKTOP_AGENT_PID_FILE" ]; then
     local old_pid
@@ -69,7 +132,7 @@ start_desktop_agent() {
     rm -f "$DESKTOP_AGENT_PID_FILE"
   fi
 
-  nohup "$VENV_DIR/bin/python" "$ROOT_DIR/desktop_agent.py" \
+  nohup env UX_FACE_LANDMARKER_MODEL="$FACE_LANDMARKER_MODEL_PATH" UX_ETH_XGAZE_MODEL_DIR="$ETH_XGAZE_MODEL_DIR" "$VENV_DIR/bin/python" "$ROOT_DIR/desktop_agent.py" \
     >"$LOG_DIR/desktop_agent.log" 2>&1 &
   echo "$!" >"$DESKTOP_AGENT_PID_FILE"
   echo "Desktop agent started with PID $(cat "$DESKTOP_AGENT_PID_FILE")"
@@ -82,11 +145,14 @@ Startup finished.
 
 Backend:
 - API: http://localhost:8000
+- PostgreSQL: localhost:5432
 - RabbitMQ UI: http://localhost:15672
 
 Artifacts:
 - Extension build: $EXT_DIST_DIR
 - Desktop agent log: $LOG_DIR/desktop_agent.log
+- Face landmarker model: $FACE_LANDMARKER_MODEL_PATH
+- ETH-XGaze checkpoint: $ETH_XGAZE_MODEL_PATH
 
 Next step in browser:
 1. Open Chrome or Edge.
@@ -103,22 +169,27 @@ Notes:
 EOF
 }
 
-require_command python3
+require_command "$PYTHON_BIN"
 require_command npm
 require_command docker
 require_command curl
+require_supported_python "$PYTHON_BIN"
 require_docker_daemon
 
 COMPOSE_CMD="$(detect_compose)"
 
 echo "Creating Python virtual environment..."
 if [ ! -d "$VENV_DIR" ]; then
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
+require_supported_venv
 
 echo "Installing Python dependencies..."
 "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
 "$VENV_DIR/bin/pip" install -r "$ROOT_DIR/requirements.txt"
+
+ensure_face_landmarker_model
+ensure_eth_xgaze_model
 
 echo "Installing extension dependencies..."
 (cd "$EXT_DIR" && npm install)
@@ -127,7 +198,7 @@ echo "Building browser extension..."
 (cd "$EXT_DIR" && npm run build)
 
 echo "Starting backend stack with Docker..."
-(cd "$ROOT_DIR" && $COMPOSE_CMD up -d --build rabbitmq api worker)
+(cd "$ROOT_DIR" && $COMPOSE_CMD up -d --build postgres rabbitmq api worker)
 
 echo "Waiting for backend healthcheck..."
 wait_for_backend

@@ -9,6 +9,7 @@ export default defineConfig({
       input: {
         background: resolve(__dirname, 'src/background/index.js'),
         popup: resolve(__dirname, 'src/popup/index.html'),
+        offscreen: resolve(__dirname, 'src/offscreen/index.html'),
       },
       output: {
         entryFileNames: '[name].js',

@@ -31,6 +31,39 @@ Main gaps:
 - no unified installer or bootstrap command,
 - metrics are stored as raw events only, without derived usability analytics.
 
+### 2.1 Implementation status as of current workspace
+
+Implemented or substantially implemented:
+
+- FastAPI routes for sessions, batched events, rrweb chunks, screen recording chunks, replay, and metrics.
+- Shared Pydantic event models in `event_models.py`.
+- PostgreSQL session metadata storage in `db.py`.
+- RabbitMQ worker persistence for raw events and rrweb chunks.
+- Browser extension capture in `ux-test-platform/` with content/background/popup scripts.
+- rrweb browser DOM recording from the extension.
+- Real screen recording from the extension via `chrome.desktopCapture` and `chrome.offscreen`.
+- Persistent retry queues for extension events, rrweb chunks, and screen recording chunks.
+- Extension task markers with active task state and optional URL/selector/text auto-completion rules.
+- Local desktop gaze bridge at `127.0.0.1:8790` for extension-to-desktop gaze sharing.
+- Python desktop agent MVP with active window, mouse/cursor, scroll, keyboard metadata, webcam gaze provider, calibration overlay, and gaze dot.
+- Live RabbitMQ gaze-to-cursor distance detector with PostgreSQL sample and aggregate tables.
+- Session metrics endpoint with gaze fixation, gaze-to-click, gaze-to-cursor, friction, and task-duration summaries.
+- Initial smoke tests for extension task-rule matching and backend task/timeline metrics.
+
+Partially implemented:
+
+- Desktop gaze accuracy and default range tuning. Guided calibration exists, but default ETH-XGaze mapping still needs machine-specific tuning.
+- Browser/desktop coordinate mapping. Extension maps desktop gaze to browser viewport, but multi-monitor and browser chrome offsets need more validation.
+- Replay. Browser rrweb replay data is available, but unified desktop video plus gaze/cursor overlay is not complete.
+
+Not implemented yet:
+
+- Full study/participant management workflow.
+- Exportable study reports and CSV.
+- Installer/setup wizard for participant machines.
+- Privacy/consent UI.
+- Broader automated test coverage for API ingestion, worker analytics, extension message flow, and desktop agent smoke tests.
+
 ## 3. Product Scope
 
 ### In scope

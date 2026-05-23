@@ -2,13 +2,7 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 pydantic>=2.0.0
 aio_pika>=8.0.0
-
 python-dotenv>=1.0.0
 aiofiles>=23.0.0
 requests>=2.32.0
-pynput>=1.7.7
-pygaze>=0.7.4
 psycopg[binary]>=3.2.0
-numpy>=1.26.0
-opencv-python>=4.10.0
-mediapipe>=0.10.14

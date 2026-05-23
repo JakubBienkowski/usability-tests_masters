@@ -9,19 +9,58 @@ function TrackingApp() {
   const [isCalibrated, setIsCalibrated] = useState(false);
 
   useTracker();
-  const { ready } = useGazeTracker(isCalibrated);
+  const {
+    ready,
+    providerMode,
+    requiresCalibration,
+    calibrationTargets,
+    startLocalCalibration,
+    submitLocalCalibrationSample,
+  } = useGazeTracker(isCalibrated);
+  const trackingActive = providerMode === 'local_bridge' ? ready && !requiresCalibration : isCalibrated;
+  const calibrationPoints = calibrationTargets.length ? calibrationTargets : undefined;
 
   return (
     <div className="App" style={{ fontFamily: 'Arial, sans-serif', minHeight: '100vh' }}>
-      {ready && !isCalibrated && (
-        <Calibration onComplete={() => setIsCalibrated(true)} />
+      {ready && requiresCalibration && !isCalibrated && (
+        <Calibration
+          points={calibrationPoints}
+          title={
+            providerMode === 'local_bridge'
+              ? 'Kalibracja desktop eye-trackera'
+              : 'Kalibracja browser eye-trackera'
+          }
+          subtitle={
+            providerMode === 'local_bridge'
+              ? 'Patrz na punkt i kliknij, aby zapisać próbkę dla lokalnego agenta.'
+              : 'Patrz dokładnie na punkt przed kliknięciem.'
+          }
+          onPointCapture={async (point) => {
+            if (providerMode !== 'local_bridge') {
+              return;
+            }
+            if (!calibrationTargets.length) {
+              await startLocalCalibration();
+            }
+            await submitLocalCalibrationSample({
+              target_x: point.x,
+              target_y: point.y,
+              screen_x: point.x * window.innerWidth,
+              screen_y: point.y * window.innerHeight,
+            });
+          }}
+          onComplete={() => setIsCalibrated(true)}
+        />
       )}
 
       <div style={{ padding: '20px', maxWidth: '1000px', margin: '0 auto' }}>
         <header style={{ marginBottom: '40px', textAlign: 'center', borderBottom: '1px solid #eee', paddingBottom: '20px' }}>
           <h1>Test Uzytecznosci + Eye Tracking</h1>
-          <p style={{ color: isCalibrated ? 'green' : 'orange', fontWeight: 'bold' }}>
-            Status: {isCalibrated ? 'TRACKING AKTYWNY (Oczy + Mysz)' : 'Wymagana kalibracja...'}
+          <p style={{ color: trackingActive ? 'green' : 'orange', fontWeight: 'bold' }}>
+            Status: {trackingActive ? 'TRACKING AKTYWNY (Oczy + Mysz)' : 'Wymagana kalibracja...'}
+          </p>
+          <p>
+            Gaze source: <code>{providerMode}</code>
           </p>
           <p>
             Replay recorded sessions at <code>?replay=session_id</code>

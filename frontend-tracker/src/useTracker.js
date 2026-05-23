@@ -3,6 +3,8 @@ import * as rrweb from 'rrweb';
 
 const API_URL = 'http://localhost:8000/api';
 const SOURCE = 'frontend_tracker';
+const EVENT_BATCH_SIZE = 20;
+const EVENT_FLUSH_INTERVAL_MS = 2000;
 
 const getSessionId = () => {
   let sid = sessionStorage.getItem('tracker_session_id');
@@ -58,9 +60,14 @@ const postJson = async (path, payload) => {
 
 export const useTracker = () => {
   const sessionId = useRef(getSessionId());
+  const eventBuffer = useRef([]);
   const eventsBuffer = useRef([]);
   const flushTimerRef = useRef(null);
+  const eventFlushTimerRef = useRef(null);
   const sessionCreatedRef = useRef(false);
+  const sessionCreatePromiseRef = useRef(null);
+  const eventFlushPromiseRef = useRef(null);
+  const rrwebFlushPromiseRef = useRef(null);
   const sequenceRef = useRef(1);
 
   useEffect(() => {
@@ -72,28 +79,130 @@ export const useTracker = () => {
 
     const createSession = async () => {
       if (sessionCreatedRef.current) return;
+      if (sessionCreatePromiseRef.current) {
+        await sessionCreatePromiseRef.current;
+        return;
+      }
 
-      await postJson('/sessions', {
-        session_id: currentSessionId,
-        source: SOURCE,
-        metadata: {
-          initial_url: window.location.href,
-          user_agent: navigator.userAgent,
-          viewport: {
-            width: window.innerWidth,
-            height: window.innerHeight,
-          },
-        },
-      });
-      sessionCreatedRef.current = true;
+      sessionCreatePromiseRef.current = (async () => {
+        try {
+          await postJson('/sessions', {
+            session_id: currentSessionId,
+            source: SOURCE,
+            metadata: {
+              initial_url: window.location.href,
+              user_agent: navigator.userAgent,
+              viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+              },
+            },
+          });
+          sessionCreatedRef.current = true;
+        } finally {
+          sessionCreatePromiseRef.current = null;
+        }
+      })();
+      await sessionCreatePromiseRef.current;
     };
 
-    const sendEvent = async (eventType, payload = {}, context = {}) => {
+    const flushEvents = async () => {
+      if (eventFlushPromiseRef.current) {
+        await eventFlushPromiseRef.current;
+        return;
+      }
+      if (!eventBuffer.current.length) return;
+
+      eventFlushPromiseRef.current = (async () => {
+        await createSession();
+        const chunk = [...eventBuffer.current];
+        eventBuffer.current = [];
+
+        try {
+          await postJson('/events', {
+            events: chunk,
+          });
+        } catch (error) {
+          eventBuffer.current = [...chunk, ...eventBuffer.current];
+          throw error;
+        } finally {
+          eventFlushPromiseRef.current = null;
+        }
+      })();
+      await eventFlushPromiseRef.current;
+    };
+
+    const flushRrweb = async () => {
+      if (rrwebFlushPromiseRef.current) {
+        await rrwebFlushPromiseRef.current;
+        return;
+      }
+      if (!eventsBuffer.current.length) return;
+
+      rrwebFlushPromiseRef.current = (async () => {
+        await createSession();
+        const chunk = [...eventsBuffer.current];
+        eventsBuffer.current = [];
+
+        try {
+          await postJson('/rrweb', {
+            session_id: currentSessionId,
+            source: SOURCE,
+            timestamp: new Date().toISOString(),
+            context: {
+              url: window.location.href,
+              title: document.title,
+            },
+            events: chunk,
+          });
+        } catch (error) {
+          eventsBuffer.current = [...chunk, ...eventsBuffer.current];
+          throw error;
+        } finally {
+          rrwebFlushPromiseRef.current = null;
+        }
+      })();
+      await rrwebFlushPromiseRef.current;
+    };
+
+    const buildEvent = (eventType, payload = {}, context = {}) => ({
+      session_id: currentSessionId,
+      source: SOURCE,
+      event_type: eventType,
+      sequence: sequenceRef.current++,
+      timestamp: new Date().toISOString(),
+      context: {
+        url: window.location.href,
+        title: document.title,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+        ...context,
+      },
+      payload,
+    });
+
+    const flushEventsSafe = () => {
+      flushEvents().catch((error) => {
+        console.warn('Event upload failed', error);
+      });
+    };
+
+    const sendEvent = (eventType, payload = {}, context = {}) => {
+      eventBuffer.current.push(buildEvent(eventType, payload, context));
+      if (eventBuffer.current.length >= EVENT_BATCH_SIZE) {
+        flushEventsSafe();
+      }
+    };
+
+    const sendSessionEventImmediately = async (eventType, payload = {}, context = {}) => {
       await createSession();
       await postJson('/events', {
         session_id: currentSessionId,
         source: SOURCE,
         event_type: eventType,
+        sequence: sequenceRef.current++,
         timestamp: new Date().toISOString(),
         context: {
           url: window.location.href,
@@ -106,30 +215,6 @@ export const useTracker = () => {
         },
         payload,
       });
-    };
-
-    const flushRrweb = async () => {
-      if (!eventsBuffer.current.length) return;
-      await createSession();
-
-      const chunk = [...eventsBuffer.current];
-      eventsBuffer.current = [];
-
-      try {
-        await postJson('/rrweb', {
-          session_id: currentSessionId,
-          source: SOURCE,
-          timestamp: new Date().toISOString(),
-          context: {
-            url: window.location.href,
-            title: document.title,
-          },
-          events: chunk,
-        });
-      } catch (error) {
-        eventsBuffer.current = [...chunk, ...eventsBuffer.current];
-        throw error;
-      }
     };
 
     const flushRrwebSafe = () => {
@@ -160,7 +245,7 @@ export const useTracker = () => {
           text: target?.innerText?.substring(0, 50) || null,
           path: getCssPath(target),
         },
-      ).catch((error) => console.warn('Click tracking failed', error));
+      );
     };
 
     const onScroll = () => {
@@ -170,7 +255,7 @@ export const useTracker = () => {
           scroll_x: window.scrollX,
           scroll_y: window.scrollY,
         },
-      ).catch((error) => console.warn('Scroll tracking failed', error));
+      );
     };
 
     const onResize = () => {
@@ -180,7 +265,7 @@ export const useTracker = () => {
           width: window.innerWidth,
           height: window.innerHeight,
         },
-      ).catch((error) => console.warn('Resize tracking failed', error));
+      );
     };
 
     const navigationObserver = new MutationObserver(() => {
@@ -194,7 +279,7 @@ export const useTracker = () => {
           from: previousUrl,
           to: lastUrl,
         },
-      ).catch((error) => console.warn('Navigation tracking failed', error));
+      );
 
       if (typeof rrweb.record.takeFullSnapshot === 'function') {
         rrweb.record.takeFullSnapshot();
@@ -202,6 +287,14 @@ export const useTracker = () => {
     });
 
     const onBeforeUnload = () => {
+      if (eventBuffer.current.length) {
+        navigator.sendBeacon(
+          `${API_URL}/events`,
+          new Blob([JSON.stringify({ events: eventBuffer.current })], {
+            type: 'application/json',
+          }),
+        );
+      }
       if (eventsBuffer.current.length) {
         navigator.sendBeacon(
           `${API_URL}/rrweb`,
@@ -225,10 +318,9 @@ export const useTracker = () => {
     };
 
     createSession().catch((error) => console.warn('Session creation failed', error));
-    sendEvent('viewport_changed', {
+    sendSessionEventImmediately('viewport_changed', {
       width: window.innerWidth,
       height: window.innerHeight,
-      sequence: sequenceRef.current++,
     }).catch((error) => console.warn('Initial viewport event failed', error));
 
     document.addEventListener('click', onClick, true);
@@ -240,12 +332,19 @@ export const useTracker = () => {
     flushTimerRef.current = window.setInterval(() => {
       flushRrwebSafe();
     }, 5000);
+    eventFlushTimerRef.current = window.setInterval(() => {
+      flushEventsSafe();
+    }, EVENT_FLUSH_INTERVAL_MS);
 
     return () => {
       window._tracking_initialized = false;
       if (flushTimerRef.current) {
         window.clearInterval(flushTimerRef.current);
       }
+      if (eventFlushTimerRef.current) {
+        window.clearInterval(eventFlushTimerRef.current);
+      }
+      flushEventsSafe();
       flushRrwebSafe();
       navigationObserver.disconnect();
       document.removeEventListener('click', onClick, true);

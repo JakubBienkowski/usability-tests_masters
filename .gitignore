@@ -1,8 +1,71 @@
-venv
-new_env
-__pycache__/
-*.pyc
+# OS / editor
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+new_env/
+pip-wheel-metadata/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Vite
+node_modules/
+frontend-tracker/node_modules/
+ux-test-platform/node_modules/
+dist/
+build/
+frontend-tracker/dist/
+frontend-tracker/build/
+ux-test-platform/dist/
+ux-test-platform/build/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local runtime state
+.desktop_agent_state.json
+scripts/.desktop_agent_state.json
+.run/
+logs/
 *.log
+*.pid
+
+# Generated session data
+recorded_sessions/
+
+# Databases / local storage
+*.sqlite
 *.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Large local model artifacts
+models/**/*.pth
+models/**/*.pt
+models/**/*.onnx
+models/**/*.task
+
+# Docker / local tooling
+docker-desktop*
