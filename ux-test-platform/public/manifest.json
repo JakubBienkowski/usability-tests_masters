@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "UX Insight Researcher",
+  "version": "1.0",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"]
+  }],
+  "action": {
+    "default_popup": "src/popup/index.html"
+  },
+  "permissions": ["storage", "scripting", "desktopCapture", "tabs", "offscreen"],
+  "host_permissions": ["<all_urls>", "http://localhost:8000/*"],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "mediapipe/face_mesh/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

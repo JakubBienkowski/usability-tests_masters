@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ux_tracker_postgres
+    environment:
+      - POSTGRES_DB=ux_tracker
+      - POSTGRES_USER=ux_tracker
+      - POSTGRES_PASSWORD=ux_tracker
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ux_tracker -d ux_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: ux_tracker_queue
+    ports:
+      - "5672:5672"   
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: ux_tracker_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./recorded_sessions:/app/recorded_sessions
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+      - DATABASE_URL=postgresql://ux_tracker:ux_tracker@postgres:5432/ux_tracker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build: .
+    container_name: ux_tracker_worker
+    command: python worker.py
+    volumes:
+      - ./recorded_sessions:/app/recorded_sessions
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+      - DATABASE_URL=postgresql://ux_tracker:ux_tracker@postgres:5432/ux_tracker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  recorded_sessions:
+  postgres_data:
