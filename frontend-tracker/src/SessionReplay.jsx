@@ -27,12 +27,16 @@ function SessionReplay() {
   const [inputValue, setInputValue] = useState(initialSessionId);
   const [availableSessions, setAvailableSessions] = useState([]);
   const [replayData, setReplayData] = useState(null);
+  const [timelineData, setTimelineData] = useState(null);
+  const [metrics, setMetrics] = useState(null);
+  const [overlayStyle, setOverlayStyle] = useState(null);
   const [error, setError] = useState('');
   const [status, setStatus] = useState(initialSessionId ? 'loading' : 'idle');
   const [currentReplayTime, setCurrentReplayTime] = useState(0);
 
   const playerHostRef = useRef(null);
   const playerStageRef = useRef(null);
+  const videoRef = useRef(null);
   const replayerRef = useRef(null);
   const rafRef = useRef(0);
 
@@ -46,6 +50,8 @@ function SessionReplay() {
   useEffect(() => {
     if (!sessionId) return undefined;
 
+    // Fetch lifecycle is intentionally mirrored in UI state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStatus('loading');
     setError('');
 
@@ -67,6 +73,22 @@ function SessionReplay() {
       });
 
     return undefined;
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    Promise.all([
+      fetch(`${API_URL}/sessions/${sessionId}/timeline`).then((response) => response.json()),
+      fetch(`${API_URL}/sessions/${sessionId}/metrics`).then((response) => response.json()),
+    ])
+      .then(([timeline, sessionMetrics]) => {
+        setTimelineData(timeline);
+        setMetrics(sessionMetrics);
+      })
+      .catch(() => {
+        setTimelineData(null);
+        setMetrics(null);
+      });
   }, [sessionId]);
 
   useEffect(() => {
@@ -136,11 +158,16 @@ function SessionReplay() {
     return { latestPoint, latestFixation };
   }, [currentReplayTime, replayBaseTimestamp, replayData]);
 
-  const overlayStyle = useMemo(() => {
+  useEffect(() => {
     const iframe = playerHostRef.current?.querySelector('iframe');
     const stage = playerStageRef.current;
     const latestPoint = currentGaze?.latestPoint;
-    if (!iframe || !stage || !latestPoint) return null;
+    if (!iframe || !stage || !latestPoint) {
+      // DOM geometry is external state and must be reflected after replay renders.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setOverlayStyle(null);
+      return;
+    }
 
     const iframeRect = iframe.getBoundingClientRect();
     const stageRect = stage.getBoundingClientRect();
@@ -150,12 +177,15 @@ function SessionReplay() {
     const x = latestPoint.payload?.screen_x ?? latestPoint.payload?.x;
     const y = latestPoint.payload?.screen_y ?? latestPoint.payload?.y;
 
-    if (typeof x !== 'number' || typeof y !== 'number') return null;
+    if (typeof x !== 'number' || typeof y !== 'number') {
+      setOverlayStyle(null);
+      return;
+    }
 
-    return {
+    setOverlayStyle({
       left: `${iframeRect.left - stageRect.left + (x / width) * iframeRect.width}px`,
       top: `${iframeRect.top - stageRect.top + (y / height) * iframeRect.height}px`,
-    };
+    });
   }, [currentGaze, fallbackViewport]);
 
   const fixationLabel = currentGaze?.latestFixation?.payload?.element || null;
@@ -168,6 +198,27 @@ function SessionReplay() {
     window.history.replaceState({}, '', url);
     setSessionId(nextSessionId);
     setInputValue(nextSessionId);
+  };
+
+  const markers = useMemo(
+    () =>
+      (timelineData?.timeline || []).filter(
+        (item) => item.kind === 'friction' || item.kind === 'marker',
+      ),
+    [timelineData],
+  );
+
+  const seekToMarker = (offsetMs) => {
+    const offset = Math.max(Number(offsetMs) || 0, 0);
+    if (replayerRef.current) {
+      replayerRef.current.pause();
+      replayerRef.current.play(offset);
+    }
+    if (videoRef.current) {
+      videoRef.current.currentTime = offset / 1000;
+      videoRef.current.play().catch(() => {});
+    }
+    setCurrentReplayTime(offset);
   };
 
   return (
@@ -198,17 +249,34 @@ function SessionReplay() {
           <div style={{ marginBottom: '8px', fontWeight: 600 }}>Recent sessions</div>
           <div style={sessionListStyle}>
             {availableSessions.map((item) => (
-              <button
-                key={item.session_id}
-                onClick={() => handleLoad(item.session_id)}
-                style={{
-                  ...sessionButtonStyle,
-                  borderColor: item.session_id === sessionId ? '#111827' : '#d1d5db',
-                }}
-              >
-                <div style={{ fontWeight: 600 }}>{item.session_id}</div>
-                <div style={smallMutedStyle}>{formatTime(item.started_at)}</div>
-              </button>
+              <div key={item.session_id} style={sessionCardStyle}>
+                <button
+                  onClick={() => handleLoad(item.session_id)}
+                  style={{
+                    ...sessionButtonStyle,
+                    border: 0,
+                    borderBottom: item.report_available ? '1px solid #e5e7eb' : 0,
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>{item.session_id}</div>
+                  <div style={smallMutedStyle}>
+                    {formatTime(item.started_at)} · {item.lifecycle?.mode || 'unknown mode'}
+                  </div>
+                  <div style={item.lifecycle?.completed ? completedStyle : recordingStyle}>
+                    {item.lifecycle?.completed ? 'Completed' : 'Recording / incomplete'}
+                  </div>
+                </button>
+                {item.report_available && (
+                  <a
+                    href={`${API_URL}/sessions/${item.session_id}/report`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={reportLinkStyle}
+                  >
+                    Open final report
+                  </a>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -218,6 +286,11 @@ function SessionReplay() {
             <div><strong>Started:</strong> {formatTime(replayData.session.started_at)}</div>
             <div><strong>Source:</strong> {replayData.session.source}</div>
             <div><strong>URL:</strong> {replayData.session.metadata?.initial_url || 'n/a'}</div>
+            <div>
+              <strong>Status:</strong>{' '}
+              {availableSessions.find((item) => item.session_id === sessionId)?.lifecycle?.status ||
+                'unknown'}
+            </div>
           </div>
         )}
 
@@ -228,10 +301,60 @@ function SessionReplay() {
           </div>
         )}
 
+        {metrics?.gaze_quality && (
+          <div style={detailsStyle}>
+            <div><strong>Gaze quality:</strong> {metrics.gaze_quality.status}</div>
+            <div><strong>Score:</strong> {metrics.gaze_quality.score}</div>
+            <div><strong>Sample rate:</strong> {metrics.gaze_samples_per_second}/s</div>
+          </div>
+        )}
+
+        {sessionId && (
+          <div style={fieldBlockStyle}>
+            <a href={`${API_URL}/sessions/${sessionId}/report`} target="_blank" rel="noreferrer">
+              {availableSessions.find((item) => item.session_id === sessionId)?.report_available
+                ? 'Final session report'
+                : 'Draft session report'}
+            </a>
+            {' · '}
+            <a href={`${API_URL}/sessions/${sessionId}/mfem.csv`}>MFEM CSV</a>
+            {' · '}
+            <a href={`${API_URL}/sessions/${sessionId}/report.json`}>Report JSON</a>
+          </div>
+        )}
+
+        <div style={fieldBlockStyle}>
+          <div style={{ marginBottom: '8px', fontWeight: 600 }}>Timeline markers</div>
+          <div style={sessionListStyle}>
+            {markers.map((marker, index) => (
+              <button
+                key={`${marker.timestamp}-${marker.event_type}-${index}`}
+                onClick={() => seekToMarker(marker.offset_ms)}
+                style={sessionButtonStyle}
+              >
+                <div style={{ fontWeight: 600 }}>
+                  {marker.payload?.marker_type || marker.event_type}
+                </div>
+                <div style={smallMutedStyle}>
+                  {((marker.offset_ms || 0) / 1000).toFixed(1)}s · {marker.payload?.severity || marker.kind}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
         {error && <div style={{ color: '#b91c1c' }}>{error}</div>}
       </div>
 
       <div style={contentStyle}>
+        {sessionId && (
+          <video
+            ref={videoRef}
+            controls
+            src={`${API_URL}/sessions/${sessionId}/screen-recording`}
+            style={{ width: '100%', maxHeight: '45vh', marginBottom: '16px', background: '#111827' }}
+          />
+        )}
         <div style={playerShellStyle}>
           {status === 'idle' && <div style={emptyStyle}>Pick a session to load replay.</div>}
           {status === 'loading' && <div style={emptyStyle}>Loading replay...</div>}
@@ -354,12 +477,43 @@ const sessionListStyle = {
 };
 
 const sessionButtonStyle = {
+  width: '100%',
   textAlign: 'left',
   background: '#ffffff',
   border: '1px solid #d1d5db',
   borderRadius: '10px',
   padding: '10px 12px',
   cursor: 'pointer',
+};
+
+const sessionCardStyle = {
+  overflow: 'hidden',
+  border: '1px solid #d1d5db',
+  borderRadius: '10px',
+  background: '#ffffff',
+};
+
+const reportLinkStyle = {
+  display: 'block',
+  padding: '8px 12px',
+  color: '#1d4ed8',
+  fontSize: '13px',
+  fontWeight: 600,
+  textDecoration: 'none',
+};
+
+const completedStyle = {
+  marginTop: '5px',
+  color: '#047857',
+  fontSize: '12px',
+  fontWeight: 600,
+};
+
+const recordingStyle = {
+  marginTop: '5px',
+  color: '#b45309',
+  fontSize: '12px',
+  fontWeight: 600,
 };
 
 const mutedStyle = {

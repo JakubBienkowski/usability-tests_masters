@@ -69,3 +69,5 @@ models/**/*.task
 
 # Docker / local tooling
 docker-desktop*
+.datasets/
+.run/screen_recordings/

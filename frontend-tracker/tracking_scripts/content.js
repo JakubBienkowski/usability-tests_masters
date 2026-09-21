@@ -195,14 +195,6 @@ const trackingCode = () => {
 
 
         let inputDebounceTimer = null; 
-        let focusedLoginElement = null;
-
-        document.addEventListener('focusin', (e) => {
-            focusedLoginElement = e.target;
-        });
-        document.addEventListener('focusout', () => {
-            focusedLoginElement = null;
-        });
 
         document.addEventListener('input', (e) => {
             if (inputDebounceTimer) clearTimeout(inputDebounceTimer);
@@ -288,7 +280,7 @@ const trackingCode = () => {
 
         let scrollTimeout;
         let lastScrollPercent = -1;
-        document.addEventListener('scroll', (e) => {
+        document.addEventListener('scroll', () => {
             clearTimeout(scrollTimeout);
             scrollTimeout = setTimeout(() => {
                 const scrollPercent = Math.round((window.scrollY / (document.body.scrollHeight - window.innerHeight)) * 100);
@@ -474,7 +466,7 @@ const trackingCode = () => {
             };
         })();
 
-        window.addEventListener('popstate', (event) => {
+        window.addEventListener('popstate', () => {
             const currentUrl = window.location.href;
             const navigationType = 'SPA_popstate';
             const triggerSource = 'popstate_event';
@@ -491,7 +483,7 @@ const trackingCode = () => {
         });
 
 
-        window.addEventListener('hashchange', (event) => {
+        window.addEventListener('hashchange', () => {
             const currentUrl = window.location.href;
             const navigationType = 'SPA_hashchange'; 
             const triggerSource = 'hashchange_event';

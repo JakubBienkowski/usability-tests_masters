@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import hypot
@@ -13,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from display_geometry import primary_screen_geometry
 from desktop_bridge import LocalGazeBridge
 from desktop_cv_gaze import OpenCvMediaPipeGazeProvider
+from desktop_screen_recorder import DesktopScreenRecorder
 from gaze_contract import (
     DEFAULT_GAZE_SAMPLE_INTERVAL_MS,
     GAZE_CONTRACT_VERSION,
@@ -26,7 +29,7 @@ from gaze_contract import (
 from pynput import keyboard, mouse
 
 
-API_URL = os.getenv("UX_API_URL", "http://localhost:8000/api")
+API_URL = os.getenv("UX_API_URL", "http://127.0.0.1:8000/api")
 STATE_FILE = Path(os.getenv("UX_AGENT_STATE_FILE", ".desktop_agent_state.json"))
 SOURCE = "desktop_agent"
 EVENT_BATCH_SIZE = 20
@@ -104,6 +107,27 @@ def run_command(command: list[str]) -> str | None:
 
 
 def active_context() -> dict[str, Any]:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title, length + 1)
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            app_name = None
+            try:
+                import psutil
+
+                app_name = psutil.Process(pid.value).name()
+            except Exception:
+                app_name = f"pid:{pid.value}" if pid.value else None
+            return {"app_name": app_name, "window_title": title.value or None}
+        except Exception:
+            return {"app_name": None, "window_title": None}
     if os.name != "posix":
         return {"app_name": None, "window_title": None}
 
@@ -128,9 +152,8 @@ def active_context() -> dict[str, Any]:
 
 
 def screen_size() -> tuple[int, int]:
-    width = int(os.getenv("UX_SCREEN_WIDTH", "1920"))
-    height = int(os.getenv("UX_SCREEN_HEIGHT", "1080"))
-    return width, height
+    geometry = primary_screen_geometry()
+    return int(geometry["width"]), int(geometry["height"])
 
 
 class LogWindow:
@@ -142,6 +165,9 @@ class LogWindow:
         self.root = None
         self.calibration_start_callback = None
         self.calibration_sample_callback = None
+        self.desktop_session_start_callback = None
+        self.desktop_session_stop_callback = None
+        self.attention_probe_callback = None
         self.calibration_overlay = None
         self.calibration_targets: list[dict[str, Any]] = []
         self.calibration_target_index = 0
@@ -160,6 +186,9 @@ class LogWindow:
         self.gaze_dot_visibility_var = None
         self.gaze_dot_size_var = None
         self.gaze_dot_color_var = None
+        self.desktop_study_var = None
+        self.desktop_participant_var = None
+        self.desktop_session_status_var = None
 
     def start(self) -> None:
         return
@@ -182,6 +211,46 @@ class LogWindow:
     def set_calibration_hooks(self, start_callback, sample_callback) -> None:
         self.calibration_start_callback = start_callback
         self.calibration_sample_callback = sample_callback
+
+    def set_desktop_session_hooks(self, start_callback, stop_callback) -> None:
+        self.desktop_session_start_callback = start_callback
+        self.desktop_session_stop_callback = stop_callback
+
+    def set_attention_probe_hook(self, callback) -> None:
+        self.attention_probe_callback = callback
+
+    def _submit_attention_probe(self, rating: int) -> None:
+        if not self.attention_probe_callback:
+            return
+        try:
+            self.attention_probe_callback(rating)
+            self.desktop_session_status_var.set(f"Focus response saved: {rating}/5")
+        except Exception as error:
+            self.desktop_session_status_var.set(f"Focus response failed: {error}")
+
+    def _start_desktop_session(self) -> None:
+        if not self.desktop_session_start_callback:
+            return
+        try:
+            result = self.desktop_session_start_callback(
+                {
+                    "study_id": self.desktop_study_var.get().strip() or None,
+                    "participant_id": self.desktop_participant_var.get().strip() or None,
+                    "label": "Desktop usability test",
+                }
+            )
+            self.desktop_session_status_var.set(f"Recording: {result['session_id']}")
+        except Exception as error:
+            self.desktop_session_status_var.set(f"Start failed: {error}")
+
+    def _stop_desktop_session(self) -> None:
+        if not self.desktop_session_stop_callback:
+            return
+        try:
+            self.desktop_session_stop_callback()
+            self.desktop_session_status_var.set("Desktop recording stopped")
+        except Exception as error:
+            self.desktop_session_status_var.set(f"Stop failed: {error}")
 
     def request_calibration(self) -> None:
         if self.enabled:
@@ -228,22 +297,59 @@ class LogWindow:
 
         controls = tk.Frame(root)
         controls.pack(fill="x")
+        self.desktop_study_var = tk.StringVar()
+        self.desktop_participant_var = tk.StringVar()
+        self.desktop_session_status_var = tk.StringVar(value="Desktop recording idle")
+        tk.Label(controls, text="Study").pack(side="left", padx=(8, 2))
+        tk.Entry(controls, textvariable=self.desktop_study_var, width=16).pack(side="left")
+        tk.Label(controls, text="Participant").pack(side="left", padx=(8, 2))
+        tk.Entry(controls, textvariable=self.desktop_participant_var, width=14).pack(side="left")
         tk.Button(
             controls,
+            text="Start Desktop Test",
+            command=self._start_desktop_session,
+        ).pack(side="left", padx=8, pady=8)
+        tk.Button(
+            controls,
+            text="Stop Desktop Test",
+            command=self._stop_desktop_session,
+        ).pack(side="left", padx=4, pady=8)
+
+        session_status = tk.Frame(root)
+        session_status.pack(fill="x")
+        tk.Label(
+            session_status,
+            textvariable=self.desktop_session_status_var,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(0, 4))
+        probe_controls = tk.Frame(root)
+        probe_controls.pack(fill="x")
+        tk.Label(probe_controls, text="Focused right now?").pack(side="left", padx=8)
+        for rating, label in ((1, "No"), (2, "2"), (3, "3"), (4, "4"), (5, "Yes")):
+            tk.Button(
+                probe_controls,
+                text=label,
+                command=lambda value=rating: self._submit_attention_probe(value),
+            ).pack(side="left", padx=2, pady=(0, 6))
+
+        gaze_controls = tk.Frame(root)
+        gaze_controls.pack(fill="x")
+        tk.Button(
+            gaze_controls,
             text="Start Desktop Calibration",
             command=self._start_calibration_overlay,
         ).pack(side="left", padx=8, pady=8)
         self.gaze_dot_visibility_var = tk.BooleanVar(value=self.gaze_dot_enabled)
         tk.Checkbutton(
-            controls,
+            gaze_controls,
             text="Show gaze dot",
             variable=self.gaze_dot_visibility_var,
             command=self._toggle_gaze_dot,
         ).pack(side="left", padx=(8, 0))
-        tk.Label(controls, text="Size").pack(side="left", padx=(14, 4))
+        tk.Label(gaze_controls, text="Size").pack(side="left", padx=(14, 4))
         self.gaze_dot_size_var = tk.IntVar(value=self.gaze_dot_size)
         tk.Scale(
-            controls,
+            gaze_controls,
             from_=12,
             to=80,
             orient="horizontal",
@@ -252,13 +358,13 @@ class LogWindow:
             length=180,
             command=self._change_gaze_dot_size,
         ).pack(side="left", padx=(0, 8))
-        tk.Label(controls, text="Color").pack(side="left", padx=(8, 4))
+        tk.Label(gaze_controls, text="Color").pack(side="left", padx=(8, 4))
         self.gaze_dot_color_var = tk.StringVar(value=self.gaze_dot_color)
-        color_entry = tk.Entry(controls, textvariable=self.gaze_dot_color_var, width=10)
+        color_entry = tk.Entry(gaze_controls, textvariable=self.gaze_dot_color_var, width=10)
         color_entry.pack(side="left", padx=(0, 4))
         color_entry.bind("<Return>", self._apply_gaze_dot_color)
         tk.Button(
-            controls,
+            gaze_controls,
             text="Apply",
             command=self._apply_gaze_dot_color,
         ).pack(side="left")
@@ -691,7 +797,7 @@ class MouseProxyGazeProvider(GazeProvider):
 
 
 class OpenCvGazeProvider(GazeProvider):
-    provider_name = "opencv_mediapipe"
+    provider_name = "eth_xgaze_webcam"
     provider_type = "native_cv"
 
     def __init__(self, emit_event):
@@ -702,12 +808,36 @@ class OpenCvGazeProvider(GazeProvider):
             emit_lost=self.emit_lost,
             sample_interval_ms=self.sample_interval_ms,
         )
+        self.provider_name = self.runtime.provider_name
 
     def start(self) -> None:
         self.runtime.start()
 
     def stop(self) -> None:
         self.runtime.stop()
+
+    def get_machine_profile(self) -> dict[str, Any]:
+        return self.runtime.get_machine_profile()
+
+    def get_calibration_status(self) -> dict[str, Any]:
+        return self.runtime.get_calibration_status()
+
+    def start_calibration(self) -> dict[str, Any]:
+        return self.runtime.start_calibration()
+
+    def submit_calibration_sample(
+        self,
+        target_x: float,
+        target_y: float,
+        screen_x: float,
+        screen_y: float,
+    ) -> dict[str, Any]:
+        return self.runtime.submit_calibration_sample(
+            target_x,
+            target_y,
+            screen_x,
+            screen_y,
+        )
 
 
 @dataclass
@@ -730,6 +860,15 @@ class DesktopAgent:
         self.recent_clicks: list[dict[str, Any]] = []
         self.emitted_friction_keys: set[str] = set()
         self.metrics_lock = threading.RLock()
+        self.session_lock = threading.RLock()
+        self.producer_sequence = 0
+        self.producer_id = f"desktop_agent:{uuid.uuid4()}"
+        self.session_metadata: dict[str, Any] = {}
+        self.capture_enabled = os.getenv("UX_REQUIRE_SESSION_JOIN", "1") != "1"
+        self.screen_recorder = DesktopScreenRecorder(
+            API_URL,
+            Path(__file__).resolve().parent / ".run" / "screen_recordings",
+        )
         self.log_window = LogWindow(enabled=LOG_WINDOW_ENABLED)
         self.bridge = LocalGazeBridge(self.session_id)
         self.gaze_provider = self.build_gaze_provider()
@@ -745,6 +884,16 @@ class DesktopAgent:
         self.bridge.set_calibration_handlers(
             self.start_calibration,
             self.submit_calibration_sample,
+        )
+        self.bridge.set_session_handler(self.change_session)
+        self.log_window.set_desktop_session_hooks(
+            self.start_desktop_session,
+            self.stop_desktop_session,
+        )
+        self.log_window.set_attention_probe_hook(self.submit_attention_probe)
+        self.bridge.set_desktop_session_handlers(
+            self.start_desktop_session,
+            self.stop_desktop_session,
         )
 
     def log(self, message: str) -> None:
@@ -785,27 +934,213 @@ class DesktopAgent:
                         self.gaze_provider.sample_interval_ms,
                     ),
                     "machine_profile": self.describe_machine(),
+                    **self.session_metadata,
                 },
             },
         )
         self.log(f"session created: {self.session_id}")
 
+    def change_session(self, session_id: str | None, metadata: dict[str, Any]) -> None:
+        if session_id is None:
+            recording: dict[str, Any] | None = None
+            recording_error: str | None = None
+            if self.screen_recorder.active:
+                try:
+                    recording = self.screen_recorder.stop_and_upload()
+                    self.emit_event(
+                        "screen_recording_saved",
+                        {"source": SOURCE, "mode": "web_desktop", **recording},
+                    )
+                except Exception as error:
+                    recording_error = str(error)
+                    self.emit_event(
+                        "screen_recording_failed",
+                        {
+                            "source": SOURCE,
+                            "mode": "web_desktop",
+                            "error": recording_error,
+                        },
+                    )
+            if self.capture_enabled:
+                self.emit_event(
+                    "session_stopped",
+                    {
+                        "source": SOURCE,
+                        "reason": "browser_session_left",
+                        "mode": "web_desktop",
+                        "recording_error": recording_error,
+                    },
+                )
+            with self.session_lock:
+                self.capture_enabled = False
+                self.session_id = None
+                self.session_metadata = {}
+            self.log("browser session left; raw capture paused")
+            return
+        with self.session_lock:
+            if session_id == self.session_id:
+                self.session_metadata.update(metadata)
+                self.capture_enabled = True
+                self.create_session()
+                return
+            previous_session_id = self.session_id
+            self.session_id = session_id
+            self.session_metadata = dict(metadata)
+            self.producer_sequence = 0
+            self.capture_enabled = True
+        self.create_session()
+        session_mode = self.session_metadata.get("mode", "web_desktop")
+        if session_mode == "web_desktop" and not self.screen_recorder.active:
+            recording = self.screen_recorder.start(session_id)
+            self.emit_event(
+                "screen_recording_started",
+                {
+                    "source": SOURCE,
+                    "mode": "web_desktop",
+                    **recording,
+                },
+            )
+        self.log(f"joined {session_mode} session: {session_id} (previous={previous_session_id})")
+
+    def start_desktop_session(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        with self.session_lock:
+            if self.capture_enabled:
+                raise RuntimeError(
+                    f"session_already_active:{self.session_id}; stop it before starting a desktop test"
+                )
+        session_id = f"sess_desktop_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        session_metadata = {
+            **metadata,
+            "run_id": f"run_{uuid.uuid4()}",
+            "mode": "desktop_only",
+            "started_from": "desktop_control",
+        }
+        self.change_session(session_id, session_metadata)
+        try:
+            recording = self.screen_recorder.start(session_id)
+        except Exception:
+            self.capture_enabled = False
+            raise
+        self.emit_event(
+            "session_started",
+            {
+                "source": SOURCE,
+                "mode": "desktop_only",
+                "screen_recording": recording,
+                "study_id": metadata.get("study_id"),
+                "participant_id": metadata.get("participant_id"),
+            },
+        )
+        self.log(f"desktop-only session started: {session_id}")
+        return {
+            "session_id": session_id,
+            "run_id": session_metadata["run_id"],
+            "mode": "desktop_only",
+            "capture_enabled": True,
+        }
+
+    def stop_desktop_session(self) -> dict[str, Any]:
+        with self.session_lock:
+            active = self.capture_enabled
+            mode = self.session_metadata.get("mode")
+            session_id = self.session_id
+        if not active:
+            return {
+                "session_id": session_id,
+                "mode": mode,
+                "capture_enabled": False,
+            }
+        if mode != "desktop_only":
+            raise RuntimeError("active session is controlled by the browser extension")
+        self.emit_event(
+            "screen_recording_stopping",
+            {"source": SOURCE, "mode": "desktop_only"},
+        )
+        recording: dict[str, Any] | None = None
+        recording_error: str | None = None
+        try:
+            recording = self.screen_recorder.stop_and_upload()
+            self.emit_event(
+                "screen_recording_saved",
+                {"source": SOURCE, "mode": "desktop_only", **recording},
+            )
+        except Exception as error:
+            recording_error = str(error)
+            self.emit_event(
+                "screen_recording_failed",
+                {
+                    "source": SOURCE,
+                    "mode": "desktop_only",
+                    "error": recording_error,
+                },
+            )
+        finally:
+            self.emit_event(
+                "session_stopped",
+                {
+                    "source": SOURCE,
+                    "mode": "desktop_only",
+                    "reason": "desktop_control",
+                    "recording_error": recording_error,
+                },
+            )
+            with self.session_lock:
+                self.capture_enabled = False
+        self.log(f"desktop-only session stopped: {session_id}")
+        result = {
+            "session_id": session_id,
+            "mode": "desktop_only",
+            "capture_enabled": False,
+            "screen_recording": recording,
+        }
+        if recording_error:
+            result["screen_recording_error"] = recording_error
+        return result
+
+    def submit_attention_probe(self, rating: int) -> dict[str, Any]:
+        if not self.capture_enabled:
+            raise RuntimeError("no active session")
+        if rating < 1 or rating > 5:
+            raise ValueError("attention rating must be between 1 and 5")
+        payload = {
+            "rating": rating,
+            "mind_wandering": rating <= 2,
+            "scale": "focus_1_5",
+            "prompt": "Focused right now?",
+        }
+        self.emit_event("attention_probe_response", payload)
+        return payload
+
     def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         timestamp = now_iso()
+        with self.session_lock:
+            self.producer_sequence += 1
+            session_id = self.session_id
+            producer_sequence = self.producer_sequence
         if event_type not in {"gaze_cursor_distance", "friction_marker"}:
             self.bridge.update(event_type, payload, timestamp)
+        if not self.capture_enabled:
+            return
         context = self.last_active_context or active_context()
         event = {
-            "session_id": self.session_id,
+            "event_id": str(uuid.uuid4()),
+            "schema_version": "2.0",
+            "session_id": session_id,
+            "run_id": self.session_metadata.get("run_id"),
+            "producer_id": self.producer_id,
+            "producer_sequence": producer_sequence,
             "source": SOURCE,
             "event_type": event_type,
+            "captured_at": timestamp,
             "timestamp": timestamp,
+            "monotonic_ns": time.monotonic_ns(),
+            "coordinate_space": payload.get("coordinate_space"),
+            "quality": payload.get("quality", {}),
             "context": context,
             "payload": payload,
         }
         self.event_queue.put(event)
         self.log_event(event_type, payload)
-        self.update_live_desktop_metrics(event)
 
     def event_point(self, event: dict[str, Any]) -> tuple[float, float] | None:
         payload = event.get("payload", {})
@@ -1109,6 +1444,7 @@ class DesktopAgent:
                     {
                         "screen_x": int(position[0]),
                         "screen_y": int(position[1]),
+                        "coordinate_space": "screen_physical_px",
                         "sample_interval_ms": DEFAULT_CURSOR_SAMPLE_INTERVAL_MS,
                         "active_sample": True,
                     },
@@ -1127,6 +1463,7 @@ class DesktopAgent:
             {
                 "screen_x": x,
                 "screen_y": y,
+                "coordinate_space": "screen_physical_px",
             },
         )
 
@@ -1184,10 +1521,13 @@ class DesktopAgent:
     def start(self) -> None:
         self.log_window.start()
         self.log(f"starting desktop agent with gaze provider={self.gaze_provider.provider_name}")
-        self.create_session()
         self.bridge.start()
         self.log(f"local gaze bridge at http://{self.bridge.host}:{self.bridge.port}")
-        self.emit_event("session_started", {"source": SOURCE})
+        if self.capture_enabled:
+            self.create_session()
+            self.emit_event("session_started", {"source": SOURCE})
+        else:
+            self.log("waiting for browser session join before recording")
         self.uploader_thread.start()
         self.context_thread.start()
         self.cursor_thread.start()

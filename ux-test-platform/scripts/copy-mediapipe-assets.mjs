@@ -1,7 +1,8 @@
 import { cp, mkdir, rm } from 'fs/promises';
 import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const sourceDir = resolve(root, 'node_modules/webgazer/dist/mediapipe/face_mesh');
 const targetDir = resolve(root, 'dist/mediapipe/face_mesh');
 

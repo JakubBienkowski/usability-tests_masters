@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,11 +32,20 @@ class SessionCreate(FlexibleModel):
 
 
 class EventIn(FlexibleModel):
+    event_id: UUID | None = None
+    schema_version: str = "2.0"
     session_id: str
+    run_id: str | None = None
+    producer_id: str | None = None
+    producer_sequence: int | None = None
     source: str = "frontend_tracker"
     event_type: str
+    captured_at: str | None = None
     timestamp: str | None = None
+    monotonic_ns: int | None = None
     sequence: int | None = None
+    coordinate_space: str | None = None
+    quality: dict[str, Any] = Field(default_factory=dict)
     context: EventContext = Field(default_factory=EventContext)
     payload: dict[str, Any] = Field(default_factory=dict)
 

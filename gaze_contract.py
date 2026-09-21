@@ -52,6 +52,7 @@ def gaze_point_payload(
         {
             "screen_x": round(screen_x),
             "screen_y": round(screen_y),
+            "coordinate_space": "screen_physical_px",
             "confidence": confidence,
             "confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
         }

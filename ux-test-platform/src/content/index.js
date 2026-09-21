@@ -23,6 +23,7 @@ const EYE_INDICES = {
 let trackerState = {
   trackingEnabled: false,
   captureGaze: true,
+  researchMode: true,
   sessionId: null,
   activeTask: null,
 };
@@ -35,8 +36,6 @@ let listenersBound = false;
 let routeObserver = null;
 let currentUrl = window.location.href;
 let lastGazeSentAt = 0;
-let lastLookedElement = null;
-let fixationStartedAt = Date.now();
 let gazeInitialized = false;
 let trackerRegistered = false;
 let gazeSampleCount = 0;
@@ -79,10 +78,19 @@ let localBridgeMode = false;
 let localCalibrationTargets = [];
 let localCalibrationRequired = false;
 let localBridgeConnected = false;
+let localBridgeLastSequence = 0;
+let localBridgeReconnectTimer = null;
 let localCalibrationClicksPerTarget = CALIBRATION_CLICKS_PER_TARGET;
 let lastSmoothedLocalPoint = null;
 let lastSmoothedWebPoint = null;
 let taskCheckTimer = null;
+let lastScrollY = window.scrollY;
+let fieldInteraction = null;
+let layoutShiftScore = 0;
+let largestContentfulPaintMs = 0;
+let maxInteractionToNextPaintMs = 0;
+let performanceSnapshotTimer = null;
+const performanceObservers = [];
 
 const smoothPoint = (nextPoint, previousPoint, alpha = 0.35) => {
   if (!previousPoint) return nextPoint;
@@ -146,6 +154,15 @@ const screenPointToViewport = (screenX, screenY) => {
     screenX - window.screenX - sideChrome,
     screenY - window.screenY - topChrome
   );
+};
+
+const viewportPointToScreen = (viewportX, viewportY) => {
+  const sideChrome = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const topChrome = Math.max(0, window.outerHeight - window.innerHeight - sideChrome);
+  return {
+    x: window.screenX + sideChrome + viewportX,
+    y: window.screenY + topChrome + viewportY,
+  };
 };
 
 const getRegressionDataSize = () => {
@@ -608,7 +625,6 @@ const getElementPayload = (element) => ({
   tag_name: element?.tagName?.toLowerCase() || null,
   id: element?.id || null,
   class_name: typeof element?.className === 'string' ? element.className : null,
-  text: element?.innerText?.substring(0, 80) || null,
   path: getCssPath(element),
 });
 
@@ -621,7 +637,7 @@ const baseContext = () => ({
   },
 });
 
-const sendEvent = (eventType, payload = {}) => {
+const sendEvent = (eventType, payload = {}, options = {}) => {
   if (!trackerState.trackingEnabled) return;
   postMessage({
     type: 'TRACK_EVENT',
@@ -629,6 +645,77 @@ const sendEvent = (eventType, payload = {}) => {
     timestamp: new Date().toISOString(),
     context: baseContext(),
     payload,
+    coordinateSpace: options.coordinateSpace || null,
+    quality: options.quality || {},
+  });
+};
+
+const schedulePerformanceSnapshot = () => {
+  if (performanceSnapshotTimer) return;
+  performanceSnapshotTimer = window.setTimeout(() => {
+    performanceSnapshotTimer = null;
+    sendEvent('web_vitals_snapshot', {
+      lcp_ms: Math.round(largestContentfulPaintMs * 100) / 100,
+      inp_ms: Math.round(maxInteractionToNextPaintMs * 100) / 100,
+      cls: Math.round(layoutShiftScore * 10000) / 10000,
+      visibility_state: document.visibilityState,
+    });
+  }, 1000);
+};
+
+const observeWebVitals = () => {
+  if (typeof PerformanceObserver !== 'function') return;
+
+  const observe = (type, callback) => {
+    try {
+      const observer = new PerformanceObserver((list) => callback(list.getEntries()));
+      observer.observe({ type, buffered: true });
+      performanceObservers.push(observer);
+    } catch {
+      // The browser does not expose this performance entry type.
+    }
+  };
+
+  observe('largest-contentful-paint', (entries) => {
+    const latest = entries.at(-1);
+    if (!latest) return;
+    largestContentfulPaintMs = Math.max(
+      largestContentfulPaintMs,
+      Number(latest.renderTime || latest.loadTime || latest.startTime || 0)
+    );
+    schedulePerformanceSnapshot();
+  });
+
+  observe('layout-shift', (entries) => {
+    entries.forEach((entry) => {
+      if (!entry.hadRecentInput) layoutShiftScore += Number(entry.value || 0);
+    });
+    schedulePerformanceSnapshot();
+  });
+
+  observe('event', (entries) => {
+    entries.forEach((entry) => {
+      if (entry.interactionId) {
+        maxInteractionToNextPaintMs = Math.max(
+          maxInteractionToNextPaintMs,
+          Number(entry.duration || 0)
+        );
+      }
+    });
+    schedulePerformanceSnapshot();
+  });
+};
+
+const emitNavigationTiming = () => {
+  const navigation = performance.getEntriesByType('navigation')[0];
+  if (!navigation) return;
+  sendEvent('page_performance', {
+    navigation_type: navigation.type || null,
+    time_to_first_byte_ms: Math.max(0, navigation.responseStart - navigation.requestStart),
+    dom_interactive_ms: navigation.domInteractive,
+    dom_content_loaded_ms: navigation.domContentLoadedEventEnd,
+    load_event_ms: navigation.loadEventEnd,
+    transfer_size_bytes: navigation.transferSize || 0,
   });
 };
 
@@ -707,7 +794,7 @@ const startRrweb = () => {
           flushRrweb();
         }
       },
-      maskAllInputs: false,
+      maskAllInputs: true,
       checkoutEveryNth: 100,
     });
   } catch (error) {
@@ -756,7 +843,7 @@ const startLocalCalibration = async () => {
   return status;
 };
 
-const handleLocalBridgePoint = (payload) => {
+const handleLocalBridgePoint = (payload, bridgeEvent = {}) => {
   const normalizedX = typeof payload?.normalized_x === 'number'
     ? payload.normalized_x
     : typeof payload?.projected_normalized_x === 'number'
@@ -791,38 +878,33 @@ const handleLocalBridgePoint = (payload) => {
   if (now - lastGazeSentAt >= GAZE_EVENT_INTERVAL_MS) {
     lastGazeSentAt = now;
     gazePointEventCount += 1;
-    sendEvent('gaze_point', {
-      ...payload,
+    sendEvent('gaze_dom_context', {
       provider: 'desktop_agent_bridge',
       provider_type: 'local_bridge',
       bridge_mode: 'local_agent',
-      screen_x: boundedPoint.x,
-      screen_y: boundedPoint.y,
-      normalized_x: Number((boundedPoint.x / Math.max(window.innerWidth, 1)).toFixed(6)),
-      normalized_y: Number((boundedPoint.y / Math.max(window.innerHeight, 1)).toFixed(6)),
-      viewport: {
+      source_bridge_sequence: bridgeEvent.bridge_sequence ?? null,
+      source_captured_at: bridgeEvent.timestamp ?? null,
+      screen: {
+        x: payload?.screen_x ?? null,
+        y: payload?.screen_y ?? null,
+        width: payload?.viewport?.width || window.screen.width,
+        height: payload?.viewport?.height || window.screen.height,
+      },
+      viewport_css: {
+        x: boundedPoint.x,
+        y: boundedPoint.y,
         width: window.innerWidth,
         height: window.innerHeight,
       },
+      document_css: {
+        x: boundedPoint.x + window.scrollX,
+        y: boundedPoint.y + window.scrollY,
+      },
+      device_pixel_ratio: window.devicePixelRatio,
+      element: meaningfulElement ? getElementPayload(meaningfulElement) : null,
     });
   }
 
-  if (!meaningfulElement) return;
-
-  if (meaningfulElement !== lastLookedElement) {
-    const duration = now - fixationStartedAt;
-    if (lastLookedElement && duration > 400) {
-      sendEvent('gaze_fixation', {
-        ...getElementPayload(lastLookedElement),
-        duration_ms: duration,
-        provider: 'desktop_agent_bridge',
-        provider_type: 'local_bridge',
-        bridge_mode: 'local_agent',
-      });
-    }
-    lastLookedElement = meaningfulElement;
-    fixationStartedAt = now;
-  }
 };
 
 const connectLocalBridge = async () => {
@@ -830,7 +912,7 @@ const connectLocalBridge = async () => {
   await syncLocalCalibrationStatus();
 
   await new Promise((resolve, reject) => {
-    const socket = new WebSocket(LOCAL_GAZE_BRIDGE_WS);
+    const socket = new WebSocket(`${LOCAL_GAZE_BRIDGE_WS}?after=${localBridgeLastSequence}`);
     localBridgeSocket = socket;
 
     const cleanup = () => {
@@ -863,35 +945,49 @@ const connectLocalBridge = async () => {
     socket.addEventListener('error', onError);
     socket.addEventListener('message', (message) => {
       const snapshot = JSON.parse(message.data);
-      const event = snapshot?.last_event;
-      if (!event) return;
-
-      if (event.event_type === 'gaze_provider_status') {
-        localCalibrationRequired = Boolean(event.payload?.calibration_required);
-        if (localCalibrationRequired && trackerState.trackingEnabled && trackerState.captureGaze) {
-          startCalibrationOverlay();
+      if (snapshot?.gap) {
+        reportDiagnostic('local_bridge_sequence_gap', {
+          oldestSequence: snapshot.oldest_sequence,
+          latestSequence: snapshot.latest_sequence,
+          droppedEvents: snapshot.dropped_events,
+        });
+      }
+      const events = Array.isArray(snapshot?.events)
+        ? snapshot.events
+        : snapshot?.last_event
+          ? [snapshot.last_event]
+          : [];
+      for (const event of events) {
+        if (typeof event.bridge_sequence === 'number') {
+          localBridgeLastSequence = Math.max(localBridgeLastSequence, event.bridge_sequence);
         }
-        sendEvent('gaze_provider_status', {
-          ...event.payload,
-          provider: 'desktop_agent_bridge',
-          provider_type: 'local_bridge',
-          bridge_mode: 'local_agent',
-        });
-        return;
-      }
+        if (event.event_type === 'gaze_provider_status') {
+          localCalibrationRequired = Boolean(event.payload?.calibration_required);
+          if (localCalibrationRequired && trackerState.trackingEnabled && trackerState.captureGaze) {
+            startCalibrationOverlay();
+          }
+          sendEvent('gaze_provider_status', {
+            ...event.payload,
+            provider: 'desktop_agent_bridge',
+            provider_type: 'local_bridge',
+            bridge_mode: 'local_agent',
+          });
+          continue;
+        }
 
-      if (event.event_type === 'gaze_lost') {
-        sendEvent('gaze_lost', {
-          ...event.payload,
-          provider: 'desktop_agent_bridge',
-          provider_type: 'local_bridge',
-          bridge_mode: 'local_agent',
-        });
-        return;
-      }
+        if (event.event_type === 'gaze_lost') {
+          sendEvent('gaze_lost', {
+            ...event.payload,
+            provider: 'desktop_agent_bridge',
+            provider_type: 'local_bridge',
+            bridge_mode: 'local_agent',
+          });
+          continue;
+        }
 
-      if (event.event_type === 'gaze_point') {
-        handleLocalBridgePoint(event.payload || {});
+        if (event.event_type === 'gaze_point') {
+          handleLocalBridgePoint(event.payload || {}, event);
+        }
       }
     });
     socket.addEventListener('close', () => {
@@ -902,6 +998,17 @@ const connectLocalBridge = async () => {
       hideExtensionGazeDot();
       removeCalibrationOverlay();
       reportDiagnostic('local_bridge_closed');
+      if (trackerState.trackingEnabled && trackerState.captureGaze) {
+        if (localBridgeReconnectTimer) window.clearTimeout(localBridgeReconnectTimer);
+        localBridgeReconnectTimer = window.setTimeout(() => {
+          localBridgeReconnectTimer = null;
+          connectLocalBridge().catch((error) => {
+            reportDiagnostic('local_bridge_reconnect_failed', {
+              message: error?.message || String(error),
+            });
+          });
+        }, 1000);
+      }
     });
   });
 };
@@ -910,6 +1017,10 @@ const stopLocalBridge = () => {
   if (localBridgeSocket) {
     localBridgeSocket.close();
     localBridgeSocket = null;
+  }
+  if (localBridgeReconnectTimer) {
+    window.clearTimeout(localBridgeReconnectTimer);
+    localBridgeReconnectTimer = null;
   }
   localBridgeConnected = false;
   localBridgeMode = false;
@@ -935,10 +1046,22 @@ const startGazeTracking = async () => {
   } catch (error) {
     reportDiagnostic('local_bridge_unavailable', {
       message: error?.message || String(error),
+      researchMode: true,
     });
     localBridgeMode = false;
+    sendEvent('gaze_provider_status', {
+      status: 'unavailable',
+      provider: 'desktop_agent_bridge',
+      provider_type: 'local_bridge',
+      reason: 'research_mode_requires_desktop_bridge',
+    });
+    gazeInitialized = false;
+    hideExtensionGazeDot();
+    if (trackerState.researchMode !== false) return;
   }
 
+  // Legacy WebGazer code below remains temporarily for migration/debugging,
+  // but research sessions never reach it: desktop gaze is the sole provider.
   if (!trackerRegistered) {
     webgazer.addTrackerModule(TRACKER_NAME, ExtensionTfjsFaceMesh);
     trackerRegistered = true;
@@ -1026,6 +1149,7 @@ const startGazeTracking = async () => {
         const now = Date.now();
         const x = boundedPoint.x;
         const y = boundedPoint.y;
+        const screenPoint = viewportPointToScreen(x, y);
         const pointedElement = document.elementFromPoint(x, y);
         const meaningfulElement = pointedElement?.closest(
           'button, input, a, h1, h2, h3, p, img, form, textarea, label'
@@ -1035,10 +1159,35 @@ const startGazeTracking = async () => {
           lastGazeSentAt = now;
           gazePointEventCount += 1;
           sendEvent('gaze_point', {
-            screen_x: boundedPoint.x,
-            screen_y: boundedPoint.y,
+            screen_x: screenPoint.x,
+            screen_y: screenPoint.y,
+            viewport_x: boundedPoint.x,
+            viewport_y: boundedPoint.y,
+            document_x: boundedPoint.x + window.scrollX,
+            document_y: boundedPoint.y + window.scrollY,
+            normalized_screen_x: Number((screenPoint.x / Math.max(window.screen.width, 1)).toFixed(6)),
+            normalized_screen_y: Number((screenPoint.y / Math.max(window.screen.height, 1)).toFixed(6)),
+            normalized_viewport_x: Number((boundedPoint.x / Math.max(window.innerWidth, 1)).toFixed(6)),
+            normalized_viewport_y: Number((boundedPoint.y / Math.max(window.innerHeight, 1)).toFixed(6)),
+            device_pixel_ratio: window.devicePixelRatio,
+            coordinate_space: 'screen_css_px',
             confidence: typeof data.confidence === 'number' ? data.confidence : null,
-          });
+          }, { coordinateSpace: 'screen_css_px' });
+          sendEvent('gaze_dom_context', {
+            source_captured_at: new Date().toISOString(),
+            viewport_css: {
+              x: boundedPoint.x,
+              y: boundedPoint.y,
+              width: window.innerWidth,
+              height: window.innerHeight,
+            },
+            document_css: {
+              x: boundedPoint.x + window.scrollX,
+              y: boundedPoint.y + window.scrollY,
+            },
+            device_pixel_ratio: window.devicePixelRatio,
+            element: meaningfulElement ? getElementPayload(meaningfulElement) : null,
+          }, { coordinateSpace: 'viewport_css_px' });
           if (gazePointEventCount === 1 || gazePointEventCount % 20 === 0) {
             reportDiagnostic('gaze_point_sent', {
               pointEventCount: gazePointEventCount,
@@ -1049,19 +1198,6 @@ const startGazeTracking = async () => {
           }
         }
 
-        if (!meaningfulElement) return;
-
-        if (meaningfulElement !== lastLookedElement) {
-          const duration = now - fixationStartedAt;
-          if (lastLookedElement && duration > 400) {
-            sendEvent('gaze_fixation', {
-              ...getElementPayload(lastLookedElement),
-              duration_ms: duration,
-            });
-          }
-          lastLookedElement = meaningfulElement;
-          fixationStartedAt = now;
-        }
       })
       .begin();
 
@@ -1098,29 +1234,15 @@ const updateGazeState = () => {
     return;
   }
 
-  if (!webgazer) return;
-
-  if (trackerState.trackingEnabled && trackerState.captureGaze) {
-    webgazer.resume();
-    webgazer.showPredictionPoints(false);
-    if (!calibrationActive && (getRegressionDataSize() ?? 0) < CALIBRATION_MIN_EXISTING_SAMPLES) {
-      startCalibrationOverlay();
-    } else if (calibrationActive) {
-      renderCalibrationOverlay();
-    }
-  } else {
-    webgazer.pause();
-    webgazer.showPredictionPoints(false);
-    hideExtensionGazeDot();
-    removeCalibrationOverlay();
-    stopLocalBridge();
-  }
+  hideExtensionGazeDot();
+  removeCalibrationOverlay();
+  if (!trackerState.trackingEnabled || !trackerState.captureGaze) stopLocalBridge();
 };
 
 const handleClick = (event) => {
   if (event.target?.closest?.('#ux-test-platform-calibration-overlay')) return;
   trainingSampleCount += 1;
-  console.error('[ux-test-platform] calibration_click_handler', {
+  console.debug('[ux-test-platform] calibration_click_handler', {
     x: event.clientX,
     y: event.clientY,
     trackingEnabled: trackerState.trackingEnabled,
@@ -1139,7 +1261,7 @@ const handleClick = (event) => {
 
 const handlePointerDown = (event) => {
   if (event.target?.closest?.('#ux-test-platform-calibration-overlay')) return;
-  console.error('[ux-test-platform] calibration_pointerdown', {
+  console.debug('[ux-test-platform] calibration_pointerdown', {
     x: event.clientX,
     y: event.clientY,
     regressionDataSize: getRegressionDataSize(),
@@ -1148,9 +1270,17 @@ const handlePointerDown = (event) => {
 };
 
 const handleScroll = () => {
+  const previousScrollY = lastScrollY;
+  lastScrollY = window.scrollY;
   sendEvent('scroll', {
     scroll_x: window.scrollX,
     scroll_y: window.scrollY,
+    delta_y: window.scrollY - previousScrollY,
+    document_height: Math.max(
+      document.documentElement?.scrollHeight || 0,
+      document.body?.scrollHeight || 0
+    ),
+    viewport_height: window.innerHeight,
   });
   scheduleTaskCheck('scroll');
 };
@@ -1167,12 +1297,71 @@ const handleResize = () => {
 
 const handleInput = (event) => {
   const target = event.target;
+  if (fieldInteraction?.target === target) fieldInteraction.editCount += 1;
   sendEvent('text_input_metadata', {
     ...getElementPayload(target),
     input_type: target?.type || null,
     value_length: typeof target?.value === 'string' ? target.value.length : null,
   });
   scheduleTaskCheck('input');
+};
+
+const handleKeyDown = (event) => {
+  if (!['Backspace', 'Delete'].includes(event.key)) return;
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)) return;
+  if (fieldInteraction?.target === target) fieldInteraction.correctionCount += 1;
+  sendEvent('input_correction', {
+    ...getElementPayload(target),
+    input_type: target.type || null,
+    correction_key: event.key,
+    value_length: typeof target.value === 'string' ? target.value.length : null,
+  });
+};
+
+const handleFocusIn = (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)
+      && !(target instanceof HTMLSelectElement)) return;
+  fieldInteraction = {
+    target,
+    startedAt: performance.now(),
+    initialLength: typeof target.value === 'string' ? target.value.length : null,
+    editCount: 0,
+    correctionCount: 0,
+  };
+};
+
+const handleFocusOut = (event) => {
+  const target = event.target;
+  if (!fieldInteraction || fieldInteraction.target !== target) return;
+  sendEvent('field_interaction', {
+    ...getElementPayload(target),
+    input_type: target.type || target.tagName?.toLowerCase() || null,
+    duration_ms: Math.max(0, performance.now() - fieldInteraction.startedAt),
+    initial_value_length: fieldInteraction.initialLength,
+    final_value_length: typeof target.value === 'string' ? target.value.length : null,
+    edit_count: fieldInteraction.editCount,
+    correction_count: fieldInteraction.correctionCount,
+  });
+  fieldInteraction = null;
+};
+
+const handleRuntimeError = (event) => {
+  sendEvent('client_error', {
+    error_type: 'javascript_error',
+    message: String(event.message || 'Unknown JavaScript error').slice(0, 500),
+    filename: event.filename ? String(event.filename).slice(0, 500) : null,
+    line: event.lineno || null,
+    column: event.colno || null,
+  });
+};
+
+const handleUnhandledRejection = (event) => {
+  sendEvent('client_error', {
+    error_type: 'unhandled_promise_rejection',
+    message: String(event.reason?.message || event.reason || 'Unhandled rejection').slice(0, 500),
+  });
 };
 
 const handleMouseMove = () => {
@@ -1186,10 +1375,25 @@ const bindListeners = () => {
   document.addEventListener('click', handleClick, true);
   document.addEventListener('pointerdown', handlePointerDown, true);
   document.addEventListener('input', handleInput, true);
+  document.addEventListener('keydown', handleKeyDown, true);
+  document.addEventListener('focusin', handleFocusIn, true);
+  document.addEventListener('focusout', handleFocusOut, true);
   document.addEventListener('mousemove', handleMouseMove, true);
   window.addEventListener('scroll', handleScroll, { passive: true });
   window.addEventListener('resize', handleResize);
+  window.addEventListener('error', handleRuntimeError);
+  window.addEventListener('unhandledrejection', handleUnhandledRejection);
   window.addEventListener('pagehide', flushRrweb);
+  window.addEventListener('pagehide', schedulePerformanceSnapshot);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') schedulePerformanceSnapshot();
+  });
+  observeWebVitals();
+  if (document.readyState === 'complete') {
+    emitNavigationTiming();
+  } else {
+    window.addEventListener('load', emitNavigationTiming, { once: true });
+  }
 
   routeObserver = new MutationObserver(() => {
     scheduleTaskCheck('dom_mutation');

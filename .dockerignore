@@ -12,10 +12,17 @@ ux-test-platform/node_modules
 
 recorded_sessions
 logs
+.run
+.datasets
+tools
+models
+.desktop_gaze_calibration.json
 
 .DS_Store
 docker-desktop*
 
+frontend-tracker
+ux-test-platform
 frontend-tracker/dist
 frontend-tracker/build
 ux-test-platform/dist
