@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ux-tracker.local/schemas/event-v2.schema.json",
+  "title": "UX Tracking Event v2",
+  "type": "object",
+  "required": [
+    "event_id",
+    "schema_version",
+    "session_id",
+    "producer_id",
+    "event_type",
+    "captured_at",
+    "context",
+    "payload"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "schema_version": { "const": "2.0" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": ["string", "null"] },
+    "producer_id": { "type": "string", "minLength": 1 },
+    "producer_sequence": { "type": ["integer", "null"], "minimum": 0 },
+    "sequence": { "type": ["integer", "null"], "minimum": 0 },
+    "source": { "type": "string" },
+    "event_type": { "type": "string", "minLength": 1 },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "timestamp": { "type": ["string", "null"], "format": "date-time" },
+    "received_at": { "type": ["string", "null"], "format": "date-time" },
+    "monotonic_ns": { "type": ["integer", "null"], "minimum": 0 },
+    "coordinate_space": {
+      "type": ["string", "null"],
+      "enum": [
+        "screen_physical_px",
+        "screen_css_px",
+        "viewport_css_px",
+        "document_css_px",
+        "normalized_screen",
+        "normalized_viewport",
+        null
+      ]
+    },
+    "quality": { "type": "object" },
+    "context": { "type": "object" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true
+}

@@ -2,6 +2,7 @@ let recorder = null;
 let stream = null;
 let chunkIndex = 0;
 let stopping = false;
+const pendingChunkSends = new Set();
 
 const blobToBase64 = (blob) =>
   new Promise((resolve, reject) => {
@@ -40,11 +41,18 @@ const sendChunk = async (event) => {
   });
 };
 
-const stopRecording = () => {
+const stopRecording = async () => {
   stopping = true;
 
+  let stopped;
+  const stoppedPromise = new Promise((resolve) => {
+    stopped = resolve;
+  });
   if (recorder && recorder.state !== 'inactive') {
+    recorder.addEventListener('stop', stopped, { once: true });
     recorder.stop();
+  } else {
+    stopped();
   }
 
   if (stream) {
@@ -53,12 +61,14 @@ const stopRecording = () => {
     }
   }
 
+  await stoppedPromise;
+  await Promise.allSettled([...pendingChunkSends]);
   recorder = null;
   stream = null;
 };
 
 const startRecording = async (streamId) => {
-  stopRecording();
+  await stopRecording();
   chunkIndex = 0;
   stopping = false;
 
@@ -76,13 +86,18 @@ const startRecording = async (streamId) => {
   const mimeType = bestMimeType();
   recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   recorder.addEventListener('dataavailable', (event) => {
-    sendChunk(event).catch((error) => {
-      chrome.runtime.sendMessage({
-        type: 'DIAGNOSTIC',
-        message: 'screen_recording_chunk_failed',
-        details: { message: error?.message || String(error) },
+    const sendPromise = sendChunk(event)
+      .catch((error) => {
+        chrome.runtime.sendMessage({
+          type: 'DIAGNOSTIC',
+          message: 'screen_recording_chunk_failed',
+          details: { message: error?.message || String(error) },
+        });
+      })
+      .finally(() => {
+        pendingChunkSends.delete(sendPromise);
       });
-    });
+    pendingChunkSends.add(sendPromise);
   });
   recorder.addEventListener('stop', () => {
     chrome.runtime.sendMessage({
@@ -92,7 +107,9 @@ const startRecording = async (streamId) => {
       payload: { chunks_recorded: chunkIndex },
     });
   });
-  stream.getVideoTracks()[0]?.addEventListener('ended', stopRecording);
+  stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+    stopRecording().catch(() => {});
+  });
   recorder.start(4000);
 
   await chrome.runtime.sendMessage({
@@ -117,7 +134,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     if (message.type === 'STOP_SCREEN_RECORDING') {
-      stopRecording();
+      await stopRecording();
       sendResponse({ ok: true });
       return;
     }

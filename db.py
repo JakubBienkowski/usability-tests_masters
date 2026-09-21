@@ -76,6 +76,28 @@ def init_db() -> None:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_events (
+                    event_id UUID PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES study_sessions(session_id) ON DELETE CASCADE,
+                    sequence BIGINT,
+                    producer_id TEXT,
+                    producer_sequence BIGINT,
+                    event_type TEXT NOT NULL,
+                    captured_at TIMESTAMPTZ NOT NULL,
+                    received_at TIMESTAMPTZ,
+                    event JSONB NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_events_producer_sequence
+                ON raw_events (session_id, producer_id, producer_sequence)
+                WHERE producer_sequence IS NOT NULL
+                """
+            )
         connection.commit()
 
 
@@ -106,7 +128,7 @@ def upsert_session(
                 VALUES (%s, %s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (session_id) DO UPDATE
                 SET
-                    source = EXCLUDED.source,
+                    source = study_sessions.source,
                     started_at = COALESCE(study_sessions.started_at, EXCLUDED.started_at),
                     updated_at = EXCLUDED.updated_at,
                     next_sequence = EXCLUDED.next_sequence,
@@ -327,3 +349,43 @@ def get_gaze_cursor_metrics(session_id: str) -> dict[str, Any] | None:
         "last_clarity_signal": row["last_clarity_signal"],
         "updated_at": row["updated_at"].isoformat(),
     }
+
+
+def insert_raw_event(event: dict[str, Any]) -> bool:
+    """Insert one canonical raw event. False means it was already ingested."""
+    captured_at = datetime.fromisoformat(
+        str(event.get("captured_at") or event.get("timestamp")).replace("Z", "+00:00")
+    )
+    received_value = event.get("received_at")
+    received_at = (
+        datetime.fromisoformat(str(received_value).replace("Z", "+00:00"))
+        if received_value
+        else None
+    )
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO raw_events (
+                    event_id, session_id, sequence, producer_id, producer_sequence,
+                    event_type, captured_at, received_at, event
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT DO NOTHING
+                RETURNING event_id
+                """,
+                (
+                    event["event_id"],
+                    event["session_id"],
+                    event.get("sequence"),
+                    event.get("producer_id") or event.get("source"),
+                    event.get("producer_sequence"),
+                    event["event_type"],
+                    captured_at,
+                    received_at,
+                    _as_json_text(event),
+                ),
+            )
+            inserted = cursor.fetchone() is not None
+        connection.commit()
+    return inserted

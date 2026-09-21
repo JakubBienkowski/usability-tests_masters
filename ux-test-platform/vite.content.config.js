@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 
-const __dirname = new URL('.', import.meta.url).pathname.slice(0, -1);
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig({
   publicDir: false,

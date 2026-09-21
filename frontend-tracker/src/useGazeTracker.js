@@ -119,7 +119,9 @@ export const useGazeTracker = (isCalibrated) => {
         const status = await response.json();
         setRequiresCalibration(Boolean(status.required));
         setCalibrationTargets(status.targets || []);
-      } catch {}
+      } catch {
+        // The local bridge is optional; the browser provider remains available.
+      }
     };
 
     const recordFixationTransition = (x, y, now, extra = {}) => {
@@ -295,7 +297,7 @@ export const useGazeTracker = (isCalibrated) => {
             });
           }
         });
-      } catch (error) {
+      } catch {
         await startWebgazerTracking();
       }
     };
